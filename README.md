@@ -1,12 +1,12 @@
 # API for Cursor
 
-Local OpenAI-compatible `chat.completions` and `responses` endpoints backed by Cursor Composer.
+Local OpenAI-compatible `chat.completions` and `responses` endpoints backed by Cursor models (Composer 2.5, Grok 4.5, and more).
 
 Download site: https://api-for-cursor.standardagents.ai
 
 ## What this is
 
-Cursor does not expose Composer as a raw OpenAI-compatible model endpoint. API for Cursor now ships as a local macOS app that starts a localhost `/v1` server, stores the Cursor API key locally, and configures local agent tools.
+Cursor does not expose Composer or other first-party models as a raw OpenAI-compatible model endpoint. API for Cursor now ships as a local macOS app that starts a localhost `/v1` server, stores the Cursor API key locally, and configures local agent tools.
 
 The hosted Worker routes remain in the repository for temporary compatibility while the local app rollout is verified. Cursor has asked us to take down the hosted API path, so the production release path is the signed macOS app.
 
@@ -15,6 +15,15 @@ The hosted Worker routes remain in the repository for temporary compatibility wh
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `GET /v1/models`
+
+## Models
+
+Primary local model ids:
+
+- `composer-2.5`
+- `composer-2.5-fast`
+- `grok-4.5`
+- `grok-4.5-fast`
 
 ## Usage
 
@@ -80,7 +89,7 @@ These OpenAI features are intentionally rejected because Cursor does not expose 
 - OpenAI function/tool calls on the Responses API
 - background Responses API jobs
 
-Token usage is estimated from character counts because Cursor's stream does not return OpenAI token accounting on this path. For Composer 2.5 and Composer 2.5 Fast, `usage.cost` is estimated from Cursor's published per-million-token pricing.
+Token usage is estimated from character counts because Cursor's stream does not return OpenAI token accounting on this path. For Composer 2.5, Composer 2.5 Fast, Grok 4.5, and Grok 4.5 Fast, `usage.cost` is estimated from Cursor's published per-million-token pricing.
 
 ## OpenCode
 
@@ -165,6 +174,7 @@ wrangler secret put CURSOR_SDK_BRIDGE_TOKEN
 - Cursor SDK package: `@cursor/sdk@1.0.13`
 - Cursor SDK TypeScript docs: https://cursor.com/docs/api/sdk/typescript
 - Cursor Composer 2.5 changelog: https://cursor.com/changelog/composer-2-5
+- Cursor Grok 4.5 docs: https://cursor.com/docs/models/grok-4-5
 - OpenAI Chat Completions reference: https://developers.openai.com/api/docs/api-reference/chat
 - OpenAI Responses reference: https://developers.openai.com/api/docs/api-reference/responses
 - OpenAI migration guide: https://developers.openai.com/api/docs/guides/migrate-to-responses

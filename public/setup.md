@@ -1,6 +1,6 @@
 # API for Cursor
 
-API for Cursor starts a local OpenAI-compatible server for Cursor Composer models. Coding agents connect to the local `/v1` base URL and keep using their own project folders, shell tools, and file workflows.
+API for Cursor starts a local OpenAI-compatible server for Cursor models, including Composer 2.5 and Grok 4.5. Coding agents connect to the local `/v1` base URL and keep using their own project folders, shell tools, and file workflows.
 
 ## Local Endpoints
 
@@ -16,6 +16,17 @@ Endpoints:
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 
+## Models
+
+Local model ids exposed by the app:
+
+- `composer-2.5`
+- `composer-2.5-fast`
+- `grok-4.5`
+- `grok-4.5-fast`
+
+Use any of these ids with Chat Completions or Responses. Hosted Cursor models available through your Cursor account may also appear via the Worker `/v1/models` list.
+
 ## OpenCode
 
 Use **Agent Setup** to configure OpenCode with a local OpenAI-compatible provider that points at your running server.
@@ -23,6 +34,9 @@ Use **Agent Setup** to configure OpenCode with a local OpenAI-compatible provide
 The model ids are:
 
 - `composer-2.5`
+- `composer-2.5-fast`
+- `grok-4.5`
+- `grok-4.5-fast`
 
 ## Codex
 
@@ -37,6 +51,10 @@ wire_api = "chat"
 [profiles.cursor-composer]
 model = "composer-2.5"
 model_provider = "cursor-composer"
+
+[profiles.cursor-grok]
+model = "grok-4.5"
+model_provider = "cursor-composer"
 ```
 
 ## Other Agents
@@ -47,4 +65,4 @@ Any client that supports an OpenAI-compatible base URL can use:
 http://127.0.0.1:8787/v1
 ```
 
-Use `composer-2.5` as the model id.
+Use a model id such as `composer-2.5` or `grok-4.5`.
