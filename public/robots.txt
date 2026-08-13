@@ -1,4 +1,0 @@
-User-agent: *
-Allow: /
-
-Sitemap: https://api-for-cursor.standardagents.ai/sitemap.xml
