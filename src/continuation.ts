@@ -12,7 +12,7 @@ export function messagesAfterLastAssistant(messages: unknown[]): unknown[] {
   let start = 0;
   for (let index = 0; index < messages.length; index += 1) {
     const item = messages[index];
-    if (isRecord(item) && item.role === "assistant") start = index + 1;
+    if (isRecord(item) && (item.role === "assistant" || item.type === "function_call")) start = index + 1;
   }
   if (start === 0 || start >= messages.length) return [];
   return messages.slice(start);

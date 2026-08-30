@@ -4,6 +4,13 @@ const MAX_STORED_TRANSCRIPT_BYTES = 256 * 1024;
 export interface SessionPrefixMatch {
   sessionKey: string;
   newInputItems: unknown[];
+  inputItems: unknown[];
+  outputItems: unknown[];
+}
+
+export interface TranscriptLeftover {
+  leftover: unknown[];
+  matched: boolean;
 }
 
 interface SessionIndexEntry {
@@ -46,15 +53,54 @@ export function rememberPrefixSession(input: {
   const entry: SessionIndexEntry = {
     ownerKey: input.ownerKey,
     sessionKey: input.sessionKey,
-    inputItems: canonicalizeItems(inputItems),
-    outputItems: canonicalizeItems(outputItems),
+    inputItems,
+    outputItems,
     updatedAt: input.updatedAt
   };
-  const key = bucketKey(input.ownerKey, entry.inputItems[0]);
+  const key = bucketKey(input.ownerKey, canonicalizeItem(entry.inputItems[0]));
   const bucket = entriesByFirstItem.get(key) ?? [];
   const next = bucket.filter((candidate) => candidate.sessionKey !== entry.sessionKey);
   next.push(entry);
   entriesByFirstItem.set(key, next);
+}
+
+/**
+ * Current input relative to a stored Responses transcript.
+ * Full prefix: client replayed input+output.
+ * Input prefix: client replayed input and reattached stored function_calls.
+ * No prefix: treat current as a delta (OpenAI previous_response_id contract).
+ */
+export function matchTranscriptPrefix(
+  currentItems: unknown[],
+  storedInput: unknown[] = [],
+  storedOutput: unknown[] = []
+): TranscriptLeftover {
+  if (!currentItems.length) {
+    return { leftover: [], matched: storedInput.length + storedOutput.length > 0 };
+  }
+  const current = canonicalizeItems(currentItems);
+  const full = canonicalizeItems([...storedInput, ...storedOutput]);
+  const inputOnly = canonicalizeItems(storedInput);
+  if (full.length && isItemPrefix(full, current)) {
+    return { leftover: currentItems.slice(full.length), matched: true };
+  }
+  if (inputOnly.length && isItemPrefix(inputOnly, current)) {
+    const functionCalls = canonicalizeItems(storedOutput).filter(isFunctionCall);
+    const leftover = currentItems.slice(inputOnly.length).filter((item) => {
+      const canonical = canonicalizeItem(item);
+      return !functionCalls.some((call) => itemsEqual(canonical, call));
+    });
+    return { leftover, matched: true };
+  }
+  return { leftover: currentItems, matched: false };
+}
+
+export function leftoverAfterTranscript(
+  currentItems: unknown[],
+  storedInput: unknown[] = [],
+  storedOutput: unknown[] = []
+): unknown[] {
+  return matchTranscriptPrefix(currentItems, storedInput, storedOutput).leftover;
 }
 
 export function matchPrefixSession(ownerKey: string | undefined, currentItems: unknown[]): SessionPrefixMatch | undefined {
@@ -62,22 +108,27 @@ export function matchPrefixSession(ownerKey: string | undefined, currentItems: u
   const current = canonicalizeItems(currentItems);
   if (!current.length) return undefined;
   const bucket = entriesByFirstItem.get(bucketKey(ownerKey, current[0])) ?? [];
-  let best: { sessionKey: string; updatedAt: number; newInputItems: unknown[] } | undefined;
+  let best: (SessionPrefixMatch & { updatedAt: number }) | undefined;
   for (const stored of bucket) {
-    const functionCalls = stored.outputItems.filter((item) => isRecord(item) && item.type === "function_call");
-    const exactPrefix = stored.outputItems.length > 0 && isItemPrefix([...stored.inputItems, ...stored.outputItems], current);
-    const inputAndCalls = stored.inputItems.length > 0
-      && isItemPrefix(stored.inputItems, current)
-      && functionCalls.every((call) => current.some((item) => itemsEqual(item, call)));
-    if (!exactPrefix && !inputAndCalls) continue;
-    const newInputItems = exactPrefix
-      ? currentItems.slice(stored.inputItems.length + stored.outputItems.length)
-      : leftoverAfterInputAndCalls(currentItems, stored.inputItems.length, functionCalls);
+    const match = matchTranscriptPrefix(currentItems, stored.inputItems, stored.outputItems);
+    if (!match.matched) continue;
     if (!best || stored.updatedAt > best.updatedAt) {
-      best = { sessionKey: stored.sessionKey, updatedAt: stored.updatedAt, newInputItems };
+      best = {
+        sessionKey: stored.sessionKey,
+        newInputItems: match.leftover,
+        inputItems: stored.inputItems,
+        outputItems: stored.outputItems,
+        updatedAt: stored.updatedAt
+      };
     }
   }
-  return best ? { sessionKey: best.sessionKey, newInputItems: best.newInputItems } : undefined;
+  if (!best) return undefined;
+  return {
+    sessionKey: best.sessionKey,
+    newInputItems: best.newInputItems,
+    inputItems: best.inputItems,
+    outputItems: best.outputItems
+  };
 }
 
 export function resetSessionIndex() {
@@ -89,13 +140,6 @@ export function boundedTranscriptItems(items: unknown[]): unknown[] {
   const json = JSON.stringify(items);
   if (Buffer.byteLength(json) <= MAX_STORED_TRANSCRIPT_BYTES) return items;
   return [];
-}
-
-function leftoverAfterInputAndCalls(currentItems: unknown[], inputPrefixLength: number, functionCalls: unknown[]): unknown[] {
-  return currentItems.slice(inputPrefixLength).filter((item) => {
-    const canonical = canonicalizeItem(item);
-    return !functionCalls.some((call) => itemsEqual(canonical, call));
-  });
 }
 
 function isItemPrefix(prefix: unknown[], current: unknown[]): boolean {
@@ -111,9 +155,12 @@ function canonicalizeItems(items: unknown[]): unknown[] {
 }
 
 function canonicalizeItem(item: unknown): unknown {
-  if (typeof item === "string") return { type: "input_text", text: item };
+  if (typeof item === "string") return { type: "message", role: "user", text: item };
   if (!isRecord(item)) return item;
   const type = typeof item.type === "string" ? item.type : typeof item.role === "string" ? "message" : "unknown";
+  if (type === "input_text" && typeof item.text === "string") {
+    return { type: "message", role: "user", text: item.text };
+  }
   if (type === "message" || typeof item.role === "string") {
     return {
       type: "message",
@@ -137,6 +184,10 @@ function canonicalizeItem(item: unknown): unknown {
     };
   }
   return { type, value: item };
+}
+
+function isFunctionCall(item: unknown): boolean {
+  return isRecord(item) && item.type === "function_call";
 }
 
 function contentTextForPrefix(content: unknown): string {

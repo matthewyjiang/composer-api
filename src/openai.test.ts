@@ -1521,6 +1521,90 @@ describe("OpenAI compatibility adapter", () => {
     expect(prepared.prompt.text).toContain("README.md");
   });
 
+  it("does not replay the previous user turn when the client resends it", () => {
+    const prepared = prepareResponsesRequest(
+      {
+        model: "composer-2.5",
+        previous_response_id: "resp_abc",
+        input: [
+          { type: "message", role: "user", content: "commit and push" },
+          { type: "message", role: "user", content: "why is the last message duplicated?" }
+        ]
+      },
+      { id: "composer-2.5" },
+      {
+        previousInputItems: [{ type: "message", role: "user", content: "commit and push" }],
+        previousOutput: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "Pushed 804be22." }]
+          }
+        ]
+      }
+    );
+
+    const userLines = prepared.prompt.text.split("\n").filter((line) => line.startsWith("USER:"));
+    expect(userLines.filter((line) => line.includes("commit and push"))).toHaveLength(1);
+    expect(userLines.filter((line) => line.includes("why is the last message duplicated?"))).toHaveLength(1);
+    expect(prepared.incrementalPrompt).toContain("why is the last message duplicated?");
+    expect(prepared.incrementalPrompt).not.toContain("commit and push");
+    expect(prepared.responseInputItems).toEqual([
+      expect.objectContaining({ role: "user", content: "commit and push" }),
+      expect.objectContaining({ role: "user", content: "why is the last message duplicated?" })
+    ]);
+  });
+
+  it("grows reconstructed input across Responses turns without duplicating users", () => {
+    const first = prepareResponsesRequest({
+      model: "composer-2.5",
+      input: [{ type: "message", role: "user", content: "turn one" }]
+    });
+    const second = prepareResponsesRequest(
+      {
+        model: "composer-2.5",
+        previous_response_id: "resp_1",
+        input: [
+          { type: "message", role: "user", content: "turn one" },
+          { type: "message", role: "user", content: "turn two" }
+        ]
+      },
+      { id: "composer-2.5" },
+      {
+        previousInputItems: first.responseInputItems,
+        previousOutput: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok one" }] }]
+      }
+    );
+    const third = prepareResponsesRequest(
+      {
+        model: "composer-2.5",
+        previous_response_id: "resp_2",
+        input: [
+          { type: "message", role: "user", content: "turn one" },
+          { type: "message", role: "user", content: "turn two" },
+          { type: "message", role: "user", content: "turn three" }
+        ]
+      },
+      { id: "composer-2.5" },
+      {
+        previousInputItems: second.responseInputItems,
+        previousOutput: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok two" }] }]
+      }
+    );
+
+    const userLines = third.prompt.text.split("\n").filter((line) => line.startsWith("USER:"));
+    expect(userLines.filter((line) => line.includes("turn one"))).toHaveLength(1);
+    expect(userLines.filter((line) => line.includes("turn two"))).toHaveLength(1);
+    expect(userLines.filter((line) => line.includes("turn three"))).toHaveLength(1);
+    expect(third.incrementalPrompt).toContain("turn three");
+    expect(third.incrementalPrompt).not.toContain("turn one");
+    expect(third.responseInputItems).toEqual([
+      expect.objectContaining({ content: "turn one" }),
+      expect.objectContaining({ content: "turn two" }),
+      expect.objectContaining({ content: "turn three" })
+    ]);
+  });
+
   it("omits incrementalPrompt on a fresh Responses request", () => {
     const prepared = prepareResponsesRequest({
       model: "composer-2.5",

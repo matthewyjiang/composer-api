@@ -665,6 +665,81 @@ describe("local OpenAI server", () => {
     expect(calls[1].prompt).toContain("README.md");
   });
 
+  it("persists reconstructed input so a third Responses turn does not duplicate users", async () => {
+    _resetResponseStateForTests();
+    const calls: Array<{ prompt: string; incrementalPrompt?: string }> = [];
+    const ctx = createContext(config(), { url: "http://127.0.0.1:8792/sdk", token: "bridge" }, {
+      now: () => new Date("2026-08-12T00:00:00Z"),
+      randomUUID: () => "00000000-0000-4000-8000-00000000000" + String(calls.length + 1),
+      runSdk: async function* (_settings, input) {
+        calls.push({ prompt: input.prompt, incrementalPrompt: input.incrementalPrompt });
+        yield { type: "text", text: `ok ${calls.length}` };
+        yield { type: "done", finalText: `ok ${calls.length}`, toolCalls: [] };
+      }
+    });
+
+    const first = await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({ model: "composer-2.5", input: [{ type: "message", role: "user", content: "turn one" }] })
+      }),
+      ctx
+    );
+    const firstBody = await first.json() as { id: string };
+    const second = await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          previous_response_id: firstBody.id,
+          input: [
+            { type: "message", role: "user", content: "turn one" },
+            { type: "message", role: "user", content: "turn two" }
+          ]
+        })
+      }),
+      ctx
+    );
+    const secondBody = await second.json() as { id: string };
+    await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          previous_response_id: secondBody.id,
+          input: [
+            { type: "message", role: "user", content: "turn one" },
+            { type: "message", role: "user", content: "turn two" },
+            { type: "message", role: "user", content: "turn three" }
+          ]
+        })
+      }),
+      ctx
+    );
+
+    const third = calls[2];
+    const userLines = third.prompt.split("\n").filter((line) => line.startsWith("USER:"));
+    expect(userLines.filter((line) => line.includes("turn one"))).toHaveLength(1);
+    expect(userLines.filter((line) => line.includes("turn two"))).toHaveLength(1);
+    expect(userLines.filter((line) => line.includes("turn three"))).toHaveLength(1);
+    expect(third.incrementalPrompt).toContain("turn three");
+    expect(third.incrementalPrompt).not.toContain("turn one");
+
+    const items = await handleRequest(
+      new Request(`http://127.0.0.1:8787/v1/responses/${secondBody.id}/input_items`, {
+        headers: { authorization: "Bearer local" }
+      }),
+      ctx
+    );
+    const listed = await items.json() as { data: Array<{ content?: unknown }> };
+    const texts = listed.data.map((item) => typeof item.content === "string" ? item.content : JSON.stringify(item.content));
+    expect(texts.filter((text) => text.includes("turn one"))).toHaveLength(1);
+    expect(texts.filter((text) => text.includes("turn two"))).toHaveLength(1);
+  });
+
   it("emits response.failed when the SDK stream throws", async () => {
     async function* run(): AsyncGenerator<CursorTextEvent> {
       throw new Error("Request body too large");

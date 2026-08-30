@@ -1,4 +1,5 @@
 import { continuationFromBody, messagesAfterLastAssistant } from "./continuation.js";
+import { leftoverAfterTranscript } from "./session-index.js";
 import { HttpError } from "./http.js";
 import { reasoningEffortFromBody, resolveCursorModel, type ResolvedCursorModel } from "./models.js";
 import { encodeSse } from "./sse.js";
@@ -309,7 +310,12 @@ export function prepareResponsesRequest(
   const instructions = typeof record.instructions === "string" ? record.instructions.trim() : "";
   if (instructions) transcript.push("", `INSTRUCTIONS:\n${instructions}`);
   transcript.push("", "INPUT:");
-  const effectiveInput = responseInputWithPrevious(record.input, options);
+  const previousInputItems = options.previousInputItems ?? [];
+  const previousOutput = options.previousOutput ?? [];
+  const currentItems = responseInputArray(record.input);
+  const leftoverItems = leftoverAfterTranscript(currentItems, previousInputItems, previousOutput);
+  const reconstructedInput = [...previousInputItems, ...leftoverItems];
+  const effectiveInput = [...previousInputItems, ...previousOutput, ...leftoverItems];
   const { text, images } = responseInputToTextAndImages(effectiveInput, tools);
   transcript.push(text || "[empty]");
   appendResponseOptions(transcript, record);
@@ -318,14 +324,13 @@ export function prepareResponsesRequest(
     ? record.previous_response_id.trim()
     : undefined;
   const storeResponse = record.store !== false;
-  const continuing =
-    Boolean(previousResponseId) ||
-    (options.previousInputItems?.length ?? 0) > 0 ||
-    (options.previousOutput?.length ?? 0) > 0;
-  const continuation = continuing ? responsesContinuationPrompt(record.input, tools) : undefined;
+  const continuing = previousInputItems.length > 0 || previousOutput.length > 0 || Boolean(previousResponseId);
+  const continuation = continuing && leftoverItems.length
+    ? responsesContinuationPrompt(leftoverItems, tools)
+    : undefined;
   const incrementalPrompt =
     continuation?.text && continuation.text !== prompt ? continuation.text : undefined;
-  const functionCallOutputs = functionCallOutputsFromInput(record.input);
+  const functionCallOutputs = functionCallOutputsFromInput(leftoverItems);
   return {
     model,
     cursorModel,
@@ -349,7 +354,7 @@ export function prepareResponsesRequest(
     requiresLocalTool: workspaceMutationRequired && !workspaceMutationDone,
     previousResponseId,
     storeResponse,
-    responseInputItems: normalizedResponseInputItems(record.input),
+    responseInputItems: normalizedResponseInputItems(reconstructedInput),
     ...(functionCallOutputs.length ? { functionCallOutputs } : {}),
     toolContext,
     ...(firstUserTextFromResponseInput(record.input) ? { conversationSeed: firstUserTextFromResponseInput(record.input) } : {})
@@ -1333,16 +1338,9 @@ function responseInputToTextAndImages(input: unknown, tools: OpenAiToolSpec[] = 
   return { text: lines.join("\n"), images };
 }
 
-function responseInputWithPrevious(
-  input: unknown,
-  options: { previousOutput?: unknown[]; previousInputItems?: unknown[] }
-): unknown {
-  const previous = [
-    ...(options.previousInputItems ?? []),
-    ...(options.previousOutput ?? [])
-  ];
-  if (!previous.length) return input;
-  return [...previous, ...responseInputArray(input)];
+export function responsesInputItemsFromBody(body: unknown): unknown[] {
+  if (!isRecord(body)) return [];
+  return responseInputArray(body.input);
 }
 
 function responseInputArray(input: unknown): unknown[] {

@@ -16,7 +16,7 @@ import {
   responseTextStartEvents,
   responseToolCallEvents,
   toOpenAiToolCalls,
-  incrementalContinuationPrompt,
+  responsesInputItemsFromBody,
   cachedCharsFromIncremental,
   type OpenAiToolSpec,
   type PreparedRequest,
@@ -27,7 +27,7 @@ import { encodeSse } from "./sse.js";
 import { baseUrl, DISPLAY_NAME, resolveRequestApiKey, type AppConfig } from "./config.js";
 import { COMPOSER_MODELS, localModelList, modelById, modelObject, resolveCursorModel } from "./models.js";
 import { collectSdkOutput, runSdkStream, type SdkBridgeSettings } from "./sdk.js";
-import { boundedTranscriptItems, hasSessionKey, matchPrefixSession, rememberPrefixSession, resetSessionIndex, touchSessionKey, type SessionPrefixMatch } from "./session-index.js";
+import { boundedTranscriptItems, matchPrefixSession, rememberPrefixSession, resetSessionIndex, touchSessionKey } from "./session-index.js";
 import type { CursorTextEvent, CursorTokenUsage } from "./types.js";
 import { createHash } from "node:crypto";
 
@@ -176,6 +176,11 @@ async function routeRequest(request: Request, ctx: ServerContext): Promise<Respo
   const ownerKey = responseOwnerKey(apiKey);
   const previousState = previousResponseId ? getResponseState(ownerKey, previousResponseId) : undefined;
   if (previousResponseId && !previousState) throw new HttpError("Response not found", 404, "not_found");
+  const affinity = route.kind === "responses" ? sessionAffinity(request) : undefined;
+  const prefixMatch =
+    route.kind === "responses" && !previousState && !affinity
+      ? matchPrefixSession(ownerKey, responsesInputItemsFromBody(body))
+      : undefined;
 
   const prepared =
     route.kind === "chat"
@@ -183,13 +188,15 @@ async function routeRequest(request: Request, ctx: ServerContext): Promise<Respo
         ? prepareOpencodeSdkChatRequest(body, cursorModel)
         : prepareChatRequest(body, cursorModel, { forceAgentMode: route.surface === "opencode" })
       : prepareResponsesRequest(body, cursorModel, {
-          previousOutput: previousState?.outputItems,
-          previousInputItems: previousState?.inputItems
+          previousOutput: previousState?.outputItems ?? prefixMatch?.outputItems,
+          previousInputItems: previousState?.inputItems ?? prefixMatch?.inputItems
         });
   const id = `${route.kind === "chat" ? "chatcmpl" : "resp"}_${idSuffix(ctx)}`;
   return handlePrepared(request, ctx, apiKey, route.kind, prepared, id, {
     ownerKey: route.kind === "responses" ? ownerKey : undefined,
-    previousState
+    previousState,
+    prefixSessionKey: prefixMatch?.sessionKey,
+    affinity
   });
 }
 
@@ -200,25 +207,23 @@ async function handlePrepared(
   kind: ApiKind,
   prepared: PreparedRequest,
   id: string,
-  state?: { ownerKey?: string; previousState?: StoredResponseState }
+  state?: {
+    ownerKey?: string;
+    previousState?: StoredResponseState;
+    prefixSessionKey?: string;
+    affinity?: string;
+  }
 ): Promise<Response> {
   const created = Math.floor(ctx.now().getTime() / 1000);
-  const affinity = sessionAffinity(request);
-  const prefixMatch =
-    kind === "responses" && state?.ownerKey && !state.previousState?.sdkSessionKey && !affinity
-      ? matchPrefixSession(state.ownerKey, prepared.responseInputItems ?? [])
-      : undefined;
+  const affinity = state?.affinity || (kind === "chat" ? sessionAffinity(request) : undefined);
   const sdkSessionKey =
     state?.previousState?.sdkSessionKey
     || affinity
-    || prefixMatch?.sessionKey
+    || state?.prefixSessionKey
     || conversationSeed(prepared)
     || id;
-  const knownSession = hasSessionKey(sdkSessionKey)
-    || Boolean(state?.previousState?.sdkSessionKey)
-    || Boolean(prefixMatch);
   touchSessionKey(sdkSessionKey);
-  const ready = attachIncrementalPrompt(prepared, knownSession, prefixMatch);
+  const ready = prepared;
 
   if (ready.stream) {
     return streamPrepared(kind, ready, request, ctx, apiKey, id, created, sdkSessionKey, state?.ownerKey);
@@ -631,21 +636,6 @@ function sessionAffinity(request: Request): string | undefined {
     request.headers.get("x-opencode-session-id") ||
     request.headers.get("x-opencode-session")
   )?.trim() || undefined;
-}
-
-function attachIncrementalPrompt(
-  prepared: PreparedRequest,
-  knownSession: boolean,
-  prefixMatch?: SessionPrefixMatch
-): PreparedRequest {
-  if (prepared.incrementalPrompt || !knownSession) return prepared;
-  const continuationInput = prefixMatch?.newInputItems?.length
-    ? prefixMatch.newInputItems
-    : prepared.responseInputItems;
-  if (!continuationInput?.length) return prepared;
-  const incremental = incrementalContinuationPrompt(continuationInput, prepared.tools);
-  if (!incremental || incremental === prepared.prompt.text) return prepared;
-  return { ...prepared, incrementalPrompt: incremental };
 }
 
 function conversationSeed(prepared: PreparedRequest): string | undefined {
