@@ -332,23 +332,31 @@ async function runLocalAgentBody(input, onRun, onEvent) {
     });
     onRun(run);
 
-    if (cancelScheduled) {
+    // Same-turn sibling tool-call-started events are already queued. Do not
+    // drain run.stream() after cancel; that iterator does not end, so Rho
+    // never got response.completed.
+    if (capturedToolCalls.length) {
+      await new Promise((resolve) => setImmediate(resolve));
       run.cancel().catch(() => {});
-    }
-
-    for await (const event of run.stream()) {
-      if (event.type === "assistant") {
-        for (const block of event.message?.content ?? []) {
-          if (block?.type === "text" && typeof block.text === "string") {
-            text += block.text;
-            if (onEvent && block.text) onEvent({ type: "text", text: block.text });
+    } else {
+      for await (const event of run.stream()) {
+        if (event.type === "assistant") {
+          for (const block of event.message?.content ?? []) {
+            if (block?.type === "text" && typeof block.text === "string") {
+              text += block.text;
+              if (onEvent && block.text) onEvent({ type: "text", text: block.text });
+            }
+          }
+          continue;
+        }
+        if (event.type === "tool_call") {
+          if (event.status && event.status !== "running") continue;
+          await captureToolCall({ type: event.name, args: event.args });
+          if (capturedToolCalls.length) {
+            run.cancel().catch(() => {});
+            break;
           }
         }
-        continue;
-      }
-      if (event.type === "tool_call") {
-        if (event.status && event.status !== "running") continue;
-        await captureToolCall({ type: event.name, args: event.args });
       }
     }
   } catch (error) {
