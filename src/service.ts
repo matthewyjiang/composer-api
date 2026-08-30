@@ -61,6 +61,9 @@ Type=simple
 ExecStart=${command}
 Restart=on-failure
 RestartSec=2
+# Bound systemctl stop (and so service uninstall): the server exits within
+# 5s of SIGTERM on its own; 10s leaves headroom before systemd escalates to SIGKILL.
+TimeoutStopSec=10
 
 [Install]
 WantedBy=default.target

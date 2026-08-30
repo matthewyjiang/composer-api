@@ -176,10 +176,18 @@ async function serve(config: AppConfig): Promise<void> {
   await new Promise<void>((resolve) => {
     const shutdown = () => {
       server.close(() => resolve());
+      // Live SSE/keep-alive connections keep close() from ever calling back;
+      // drop them so `systemctl stop` does not hang until its kill timeout.
+      server.closeAllConnections();
+      // Failsafe: the in-process bridge server and any Cursor runs also hold
+      // the event loop open. 5s is far above a close() round-trip on localhost.
+      setTimeout(() => resolve(), 5000).unref();
     };
     process.once("SIGINT", shutdown);
     process.once("SIGTERM", shutdown);
   });
+  // The bridge HTTP server (still listening) would keep the process alive.
+  process.exit(0);
 }
 
 function parseArgs(argv: string[]): CliOptions {
