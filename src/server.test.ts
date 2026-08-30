@@ -167,6 +167,59 @@ describe("local OpenAI server", () => {
     expect(completedIds).toEqual(streamedIds);
   });
 
+  it("keeps function_call output ids aligned when done.finalText is empty after streamed prose", async () => {
+    async function* run(): AsyncGenerator<CursorTextEvent> {
+      yield { type: "text", text: "I'll read the file." };
+      yield { type: "tool_call", toolCall: { name: "read", arguments: { path: "AGENTS.md" } } };
+      yield { type: "done", finalText: "", toolCalls: [{ name: "read", arguments: { path: "AGENTS.md" } }] };
+    }
+    const ctx = context(run);
+    const response = await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          stream: true,
+          input: "read the docs",
+          tools: [
+            {
+              type: "function",
+              name: "read_file",
+              parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+            }
+          ]
+        })
+      }),
+      ctx
+    );
+    const streamedIds: string[] = [];
+    const streamedCallIds: string[] = [];
+    let completedIds: string[] = [];
+    let completedCallIds: string[] = [];
+    for await (const event of parseSse(response.body)) {
+      if (!event.data || event.data === "[DONE]") continue;
+      const payload = JSON.parse(event.data) as {
+        type?: string;
+        item?: { type?: string; id?: string; call_id?: string };
+        response?: { output?: Array<{ type?: string; id?: string; call_id?: string }> };
+      };
+      if (payload.type === "response.output_item.added" && payload.item?.type === "function_call") {
+        if (payload.item.id) streamedIds.push(payload.item.id);
+        if (payload.item.call_id) streamedCallIds.push(payload.item.call_id);
+      }
+      if (payload.type === "response.completed") {
+        const calls = (payload.response?.output ?? []).filter((item) => item.type === "function_call");
+        completedIds = calls.map((item) => item.id).filter((id): id is string => Boolean(id));
+        completedCallIds = calls.map((item) => item.call_id).filter((id): id is string => Boolean(id));
+      }
+    }
+    expect(streamedCallIds).toHaveLength(1);
+    expect(completedCallIds).toEqual(streamedCallIds);
+    expect(completedIds).toEqual(streamedIds);
+    expect(new Set(completedCallIds).size).toBe(1);
+  });
+
   it("streams multiple function_call items from one SDK turn", async () => {
     async function* run(): AsyncGenerator<CursorTextEvent> {
       yield { type: "tool_call", toolCall: { name: "grep", arguments: { pattern: "foo" } } };

@@ -394,7 +394,9 @@ function streamOpenAiEvents(
           toolCallCount += 1;
         }
         if (event.type === "done") {
-          text = event.finalText;
+          // Bridge tool turns send empty finalText. Keep streamed prose so
+          // completed output_index matches the function_call already emitted.
+          if (event.finalText) text = event.finalText;
         }
       }
 
