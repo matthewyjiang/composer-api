@@ -315,6 +315,9 @@ function sdkInput(prepared: PreparedRequest, apiKey: string, sessionKey: string,
     model: cursorModel?.sdkId || cursorModel?.id || prepared.model,
     ...(cursorModel?.params?.length ? { modelParams: cursorModel.params } : {}),
     prompt: prepared.prompt.text,
+    ...(prepared.incrementalPrompt && prepared.incrementalPrompt !== prepared.prompt.text
+      ? { incrementalPrompt: prepared.incrementalPrompt }
+      : {}),
     sessionKey,
     runId: `run-${ctx.randomUUID()}`,
     workingDirectory: prepared.toolContext?.workingDirectory,

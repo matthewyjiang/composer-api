@@ -1415,6 +1415,50 @@ describe("OpenAI compatibility adapter", () => {
     expect(prepared.requiresLocalTool).toBe(false);
   });
 
+  it("sets a continuation incrementalPrompt from new Responses input only", () => {
+    const prepared = prepareResponsesRequest(
+      {
+        model: "composer-2.5",
+        previous_response_id: "resp_abc",
+        input: [{ type: "function_call_output", call_id: "call_1", output: "README.md" }],
+        tools: [
+          {
+            type: "function",
+            name: "read_file",
+            parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+          }
+        ]
+      },
+      { id: "composer-2.5" },
+      {
+        previousInputItems: [{ role: "user", content: [{ type: "input_text", text: "what is this repo?" }] }],
+        previousOutput: [
+          {
+            type: "function_call",
+            call_id: "call_1",
+            name: "read_file",
+            arguments: "{\"path\":\"README.md\"}"
+          }
+        ]
+      }
+    );
+
+    expect(prepared.incrementalPrompt).toContain("Continue from this new input only:");
+    expect(prepared.incrementalPrompt).toContain("README.md");
+    expect(prepared.incrementalPrompt).toContain("LOCAL TOOL RESULT:");
+    expect(prepared.incrementalPrompt).not.toContain("what is this repo?");
+    expect(prepared.prompt.text).toContain("what is this repo?");
+    expect(prepared.prompt.text).toContain("README.md");
+  });
+
+  it("omits incrementalPrompt on a fresh Responses request", () => {
+    const prepared = prepareResponsesRequest({
+      model: "composer-2.5",
+      input: "hello"
+    });
+    expect(prepared.incrementalPrompt).toBeUndefined();
+  });
+
   it("converts Responses input arrays", () => {
     const prepared = prepareResponsesRequest(
       {

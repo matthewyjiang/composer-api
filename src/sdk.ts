@@ -94,12 +94,14 @@ export async function* runSdkStream(
       return;
     }
 
+    const retryIncremental = rejectedToolCall
+      ? retryIncrementalAfterUnsupportedTool(rejectedToolCall, rejectedReason, attempt + 1)
+      : retryIncrementalAfterMissingTool(attempt + 1);
     attemptInput = {
       ...input,
       runId: `run-${crypto.randomUUID()}`,
-      prompt: rejectedToolCall
-        ? retryPromptAfterUnsupportedTool(input.prompt, rejectedToolCall, rejectedReason, attempt + 1)
-        : retryPromptAfterMissingTool(input.prompt, attempt + 1)
+      prompt: [input.prompt, "", retryIncremental].join("\n"),
+      incrementalPrompt: retryIncremental
     };
   }
 }
@@ -231,10 +233,8 @@ async function* parseNdjson(body: ReadableStream<Uint8Array> | null): AsyncGener
   }
 }
 
-function retryPromptAfterMissingTool(prompt: string, attempt: number): string {
+function retryIncrementalAfterMissingTool(attempt: number): string {
   return [
-    prompt,
-    "",
     `TOOL CALL RETRY (attempt ${attempt} of ${TOOL_RETRY_ATTEMPTS}):`,
     "Your previous SDK response did not emit a local tool call, but the latest user request requires local execution.",
     "The next response is invalid unless it contains a tool_call.",
@@ -242,10 +242,8 @@ function retryPromptAfterMissingTool(prompt: string, attempt: number): string {
   ].join("\n");
 }
 
-function retryPromptAfterUnsupportedTool(prompt: string, toolCall: CursorToolCall, reason: string | undefined, attempt: number): string {
+function retryIncrementalAfterUnsupportedTool(toolCall: CursorToolCall, reason: string | undefined, attempt: number): string {
   return [
-    prompt,
-    "",
     `TOOL CALL RETRY (attempt ${attempt} of ${TOOL_RETRY_ATTEMPTS}):`,
     `Your previous SDK response requested ${toolCall.name}, but that tool could not be mapped to the allowed client tool inventory above.`,
     ...(reason ? [`Mapping failure detail: ${reason}`] : []),

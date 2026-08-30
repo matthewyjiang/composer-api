@@ -50,6 +50,22 @@ describe("runSdkStream", () => {
     await iterator.next();
   });
 
+  it("posts a distinct incrementalPrompt", async () => {
+    let body: Record<string, unknown> | undefined;
+    globalThis.fetch = async (_url, init) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(ndjsonStream([JSON.stringify({ type: "done", output: { text: "ok", toolCalls: [] } })]), {
+        status: 200
+      });
+    };
+
+    for await (const _event of runSdkStream(settings, input({ incrementalPrompt: "TOOL RESULT: README.md" }))) {
+      // drain
+    }
+    expect(body?.prompt).toBe("hello");
+    expect(body?.incrementalPrompt).toBe("TOOL RESULT: README.md");
+  });
+
   it("omits incrementalPrompt when it matches the full prompt", async () => {
     let body: Record<string, unknown> | undefined;
     globalThis.fetch = async (_url, init) => {

@@ -9,6 +9,8 @@ export interface PreparedRequest {
   model: string;
   cursorModel?: ResolvedCursorModel;
   prompt: CursorPrompt;
+  /** New input only, for a cached Cursor session. Never a replay of the full transcript. */
+  incrementalPrompt?: string;
   stream: boolean;
   includeUsage: boolean;
   promptChars: number;
@@ -287,10 +289,18 @@ export function prepareResponsesRequest(
     ? record.previous_response_id.trim()
     : undefined;
   const storeResponse = record.store !== false;
+  const continuing =
+    Boolean(previousResponseId) ||
+    (options.previousInputItems?.length ?? 0) > 0 ||
+    (options.previousOutput?.length ?? 0) > 0;
+  const continuation = continuing ? responsesContinuationPrompt(record.input, tools) : undefined;
+  const incrementalPrompt =
+    continuation?.text && continuation.text !== prompt ? continuation.text : undefined;
   return {
     model,
     cursorModel,
     prompt: { text: prompt, mode: tools.length ? "agent" : "ask", ...(images.length ? { images } : {}) },
+    ...(incrementalPrompt ? { incrementalPrompt } : {}),
     stream: record.stream === true,
     includeUsage: includeStreamUsage(record),
     promptChars: prompt.length,
@@ -1195,6 +1205,19 @@ function appendJsonConstraint(constraints: string[], format: unknown) {
     const schema = isRecord(format.json_schema) ? format.json_schema.schema : format.schema;
     constraints.push(`Return JSON that matches this schema: ${JSON.stringify(schema ?? format)}`);
   }
+}
+
+function responsesContinuationPrompt(input: unknown, tools: OpenAiToolSpec[]): { text?: string; images: CursorImage[] } {
+  const { text, images } = responseInputToTextAndImages(input, tools);
+  if (!text.trim() || images.length) return { images };
+  return {
+    text: [
+      "This Cursor session already has the earlier conversation. Continue from this new input only:",
+      "",
+      text
+    ].join("\n"),
+    images
+  };
 }
 
 function responseInputToTextAndImages(input: unknown, tools: OpenAiToolSpec[] = []): { text: string; images: CursorImage[] } {

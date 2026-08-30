@@ -64,7 +64,8 @@ export {
   statusFromError,
   startServer,
   validateClientMcpToolCall,
-  toolCallFromDelta
+  toolCallFromDelta,
+  hasDistinctIncrementalPrompt
 };
 
 function startServer() {
@@ -111,10 +112,11 @@ async function handleRequest(request, response) {
   const body = await readJsonBody(request);
   const apiKey = requiredString(body.apiKey, "apiKey");
   const prompt = requiredString(body.prompt, "prompt");
-  const incrementalPrompt = typeof body.incrementalPrompt === "string" && body.incrementalPrompt.trim()
-    ? body.incrementalPrompt
-    : prompt;
   const promptAlreadyPrepared = body.promptAlreadyPrepared === true;
+  const rawIncremental = typeof body.incrementalPrompt === "string" && body.incrementalPrompt.trim()
+    ? body.incrementalPrompt
+    : "";
+  const distinctIncremental = hasDistinctIncrementalPrompt(prompt, rawIncremental) ? rawIncremental : undefined;
   const model = normalizeModel(typeof body.model === "string" ? body.model : "");
   const modelParams = parseModelParams(body.modelParams);
   const sessionKey = typeof body.sessionKey === "string" && body.sessionKey ? body.sessionKey : crypto.randomUUID();
@@ -128,7 +130,11 @@ async function handleRequest(request, response) {
     model,
     modelParams,
     prompt: promptAlreadyPrepared ? prompt : bridgePrompt(prompt, clientTools),
-    incrementalPrompt: promptAlreadyPrepared ? incrementalPrompt : bridgePrompt(incrementalPrompt, clientTools),
+    incrementalPrompt: distinctIncremental
+      ? promptAlreadyPrepared
+        ? distinctIncremental
+        : bridgePrompt(distinctIncremental, clientTools)
+      : undefined,
     sessionKey,
     workingDirectory,
     requestId,
@@ -290,8 +296,16 @@ async function runLocalAgentBody(input, onRun, onEvent) {
   });
   try {
     agentEntry = await getAgent(input);
+    // Replaying the full OpenAI transcript into a cached Cursor agent restates
+    // the original user request every tool turn. Only reuse the agent when the
+    // client sent a real delta.
+    const reuseCache = agentEntry.cached && hasDistinctIncrementalPrompt(input.prompt, input.incrementalPrompt);
+    if (agentEntry.cached && !reuseCache) {
+      evictAgent(agentEntry.cacheKey, agentEntry.agent);
+      agentEntry = await getAgent(input);
+    }
     const agent = agentEntry.agent;
-    const prompt = agentEntry.cached && input.incrementalPrompt ? input.incrementalPrompt : input.prompt;
+    const prompt = reuseCache ? input.incrementalPrompt : input.prompt;
     const force = forceNextRunAgentKeys.delete(cacheKey);
 
     run = await agent.send(prompt, {
@@ -2098,6 +2112,10 @@ function sdkWorkingDirectory(value) {
 
 function stripFinalMarker(text) {
   return text.replace(/\s*<\/?(?:final_answer|answer)>\s*$/gi, "").trim();
+}
+
+function hasDistinctIncrementalPrompt(prompt, incrementalPrompt) {
+  return typeof incrementalPrompt === "string" && incrementalPrompt.trim() !== "" && incrementalPrompt !== prompt;
 }
 
 function requiredString(value, key) {

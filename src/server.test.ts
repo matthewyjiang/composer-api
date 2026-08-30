@@ -167,6 +167,56 @@ describe("local OpenAI server", () => {
     expect(completedIds).toEqual(streamedIds);
   });
 
+  it("passes new Responses input as incrementalPrompt on previous_response_id follow-up", async () => {
+    _resetResponseStateForTests();
+    const calls: Array<{ prompt: string; incrementalPrompt?: string; sessionKey: string }> = [];
+    const ctx = createContext(config(), { url: "http://127.0.0.1:8792/sdk", token: "bridge" }, {
+      now: () => new Date("2026-08-12T00:00:00Z"),
+      randomUUID: () => "00000000-0000-4000-8000-000000000001",
+      runSdk: async function* (_settings, input) {
+        calls.push({
+          prompt: input.prompt,
+          incrementalPrompt: input.incrementalPrompt,
+          sessionKey: input.sessionKey
+        });
+        yield { type: "text", text: "Hello from Composer." };
+        yield { type: "done", finalText: "Hello from Composer.", toolCalls: [] };
+      }
+    });
+
+    const created = await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({ model: "composer-2.5", input: "Hello" })
+      }),
+      ctx
+    );
+    const body = await created.json() as { id: string };
+
+    await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          previous_response_id: body.id,
+          input: [{ type: "function_call_output", call_id: "call_1", output: "README.md" }]
+        })
+      }),
+      ctx
+    );
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0].incrementalPrompt).toBeUndefined();
+    expect(calls[0].prompt).toContain("Hello");
+    expect(calls[1].sessionKey).toBe(calls[0].sessionKey);
+    expect(calls[1].incrementalPrompt).toContain("README.md");
+    expect(calls[1].incrementalPrompt).not.toContain("Hello");
+    expect(calls[1].prompt).toContain("Hello");
+    expect(calls[1].prompt).toContain("README.md");
+  });
+
   it("emits response.failed when the SDK stream throws", async () => {
     async function* run(): AsyncGenerator<CursorTextEvent> {
       throw new Error("Request body too large");

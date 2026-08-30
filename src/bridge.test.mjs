@@ -17,12 +17,20 @@ import {
   sdkRunFailureSummary,
   statusFromError,
   toolCallFromDelta,
-  validateClientMcpToolCall
+  validateClientMcpToolCall,
+  hasDistinctIncrementalPrompt
 } from "./bridge.mjs";
 
 const bridgeScriptPath = fileURLToPath(new URL("./bridge.mjs", import.meta.url));
 
 describe("Cursor SDK local-agent bridge", () => {
+  it("treats missing or identical incrementalPrompt as not a continuation delta", () => {
+    expect(hasDistinctIncrementalPrompt("full transcript", undefined)).toBe(false);
+    expect(hasDistinctIncrementalPrompt("full transcript", "")).toBe(false);
+    expect(hasDistinctIncrementalPrompt("full transcript", "full transcript")).toBe(false);
+    expect(hasDistinctIncrementalPrompt("full transcript", "TOOL RESULT: README.md")).toBe(true);
+  });
+
   it("classifies retryable Cursor SDK upstream capacity errors", () => {
     expect(isRetryableSDKRunError(new Error("Server at capacity"))).toBe(true);
     expect(isRetryableSDKRunError({ cause: { isRetryable: true } })).toBe(true);
