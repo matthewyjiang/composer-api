@@ -105,6 +105,26 @@ describe("Cursor SDK local-agent bridge", () => {
     });
   });
 
+  it("merges request modelParams over default fast selection", () => {
+    expect(
+      localAgentCreateOptions({
+        apiKey: "test",
+        model: "grok-4.6",
+        modelParams: [
+          { id: "fast", value: "true" },
+          { id: "effort", value: "high" }
+        ],
+        workingDirectory: process.cwd()
+      }).model
+    ).toEqual({
+      id: "grok-4.6",
+      params: [
+        { id: "fast", value: "true" },
+        { id: "effort", value: "high" }
+      ]
+    });
+  });
+
   it("serializes overlapping runs for the same stateful SDK agent", async () => {
     const input = {
       apiKey: "test-key",

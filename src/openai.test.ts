@@ -11,6 +11,46 @@ import {
 } from "./openai.js";
 
 describe("OpenAI compatibility adapter", () => {
+  it("routes chat reasoning_effort into Cursor model params", () => {
+    const prepared = prepareChatRequest({
+      model: "grok-4.6-fast",
+      reasoning_effort: "high",
+      messages: [{ role: "user", content: "think hard" }]
+    });
+    expect(prepared.cursorModel).toEqual({
+      id: "grok-4.6-high-fast",
+      sdkId: "grok-4.6",
+      params: [
+        { id: "fast", value: "true" },
+        { id: "effort", value: "high" }
+      ],
+      reasoningEffort: "high"
+    });
+    expect(prepared.responseMetadata.reasoning).toEqual({ effort: "high", summary: null });
+  });
+
+  it("routes Responses reasoning.effort into Cursor model params", () => {
+    const prepared = prepareResponsesRequest({
+      model: "grok-4.6",
+      reasoning: { effort: "low" },
+      input: "hello"
+    });
+    expect(prepared.cursorModel?.params).toEqual([
+      { id: "fast", value: "false" },
+      { id: "effort", value: "low" }
+    ]);
+    expect(prepared.responseMetadata.reasoning).toEqual({ effort: "low", summary: null });
+  });
+
+  it("accepts effort-encoded model ids without a body field", () => {
+    const prepared = prepareChatRequest({
+      model: "grok-4.6-medium-fast",
+      messages: [{ role: "user", content: "hi" }]
+    });
+    expect(prepared.cursorModel?.reasoningEffort).toBe("medium");
+    expect(prepared.cursorModel?.params).toContainEqual({ id: "effort", value: "medium" });
+  });
+
   it("converts chat messages and image URLs into Cursor prompts", () => {
     const prepared = prepareChatRequest(
       {

@@ -95,6 +95,35 @@ npm link
 - `grok-4.5`
 - `grok-4.5-fast`
 
+### Reasoning effort
+
+Grok models accept reasoning effort through the normal OpenAI request fields (preferred) or model-id suffixes.
+
+Chat Completions:
+
+```json
+{
+  "model": "grok-4.6-fast",
+  "reasoning_effort": "high",
+  "messages": [{ "role": "user", "content": "..." }]
+}
+```
+
+Responses:
+
+```json
+{
+  "model": "grok-4.6-fast",
+  "reasoning": { "effort": "high" },
+  "input": "..."
+}
+```
+
+Allowed Grok 4.6 efforts: `low`, `medium`, `high`, `xhigh` (also accepts OpenAI-style `extra-high`).  
+Allowed Grok 4.5 efforts: `low`, `medium`, `high`.
+
+Equivalent model ids also work, for example `grok-4.6-high-fast` or `grok-4.6-xhigh`. Body `reasoning_effort` / `reasoning.effort` overrides effort encoded in the model id. Composer models do not support effort.
+
 ## Supported endpoints
 
 - `POST /v1/chat/completions`
@@ -114,6 +143,8 @@ These OpenAI features are rejected because Cursor does not expose equivalent con
 - `logprobs` and `top_logprobs`
 - audio output
 - background Responses API jobs
+
+`reasoning.effort` / `reasoning_effort` are supported for models that expose Cursor effort/reasoning params (see above).
 
 Token usage is estimated from character counts because Cursor's stream does not return OpenAI token accounting on this path. For all listed models, `usage.cost` is estimated from Cursor's published per-million-token pricing.
 

@@ -9,9 +9,16 @@ export interface SdkBridgeSettings {
   token: string;
 }
 
+export interface SdkModelParam {
+  id: string;
+  value: string;
+}
+
 export interface SdkRunInput {
   apiKey: string;
   model: string;
+  /** Cursor SDK model params (fast, effort, reasoning, …). */
+  modelParams?: SdkModelParam[];
   prompt: string;
   incrementalPrompt?: string;
   sessionKey: string;
@@ -100,6 +107,7 @@ async function* runSdkBridgeOnce(
       apiKey: input.apiKey,
       requestId: input.runId,
       model: input.model,
+      ...(input.modelParams?.length ? { modelParams: input.modelParams } : {}),
       prompt: input.prompt,
       incrementalPrompt: input.incrementalPrompt ?? input.prompt,
       promptAlreadyPrepared: true,

@@ -307,9 +307,12 @@ function streamPrepared(
 }
 
 function sdkInput(prepared: PreparedRequest, apiKey: string, sessionKey: string, ctx: ServerContext) {
+  const cursorModel = prepared.cursorModel;
   return {
     apiKey,
-    model: prepared.cursorModel?.id || prepared.model,
+    // Bridge expects a base/public model id; params carry effort/fast separately.
+    model: cursorModel?.sdkId || cursorModel?.id || prepared.model,
+    ...(cursorModel?.params?.length ? { modelParams: cursorModel.params } : {}),
     prompt: prepared.prompt.text,
     sessionKey,
     runId: `run-${ctx.randomUUID()}`,

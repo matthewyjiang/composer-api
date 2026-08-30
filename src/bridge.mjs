@@ -53,7 +53,9 @@ export {
   normalizeSDKToolCall,
   normalizeModel,
   openAiError,
+  parseModelParams,
   runExclusiveForAgent,
+  sdkModelSelection,
   sdkRunFailureSummary,
   statusFromError,
   startServer,
@@ -105,6 +107,7 @@ async function handleRequest(request, response) {
     : prompt;
   const promptAlreadyPrepared = body.promptAlreadyPrepared === true;
   const model = normalizeModel(typeof body.model === "string" ? body.model : "");
+  const modelParams = parseModelParams(body.modelParams);
   const sessionKey = typeof body.sessionKey === "string" && body.sessionKey ? body.sessionKey : crypto.randomUUID();
   const workingDirectory = sdkWorkingDirectory(body.workingDirectory);
   const requestId = typeof body.requestId === "string" && body.requestId ? body.requestId : crypto.randomUUID();
@@ -114,6 +117,7 @@ async function handleRequest(request, response) {
   const input = {
     apiKey,
     model,
+    modelParams,
     prompt: promptAlreadyPrepared ? prompt : bridgePrompt(prompt, clientTools),
     incrementalPrompt: promptAlreadyPrepared ? incrementalPrompt : bridgePrompt(incrementalPrompt, clientTools),
     sessionKey,
@@ -403,7 +407,7 @@ async function captureActiveClientToolCall(cacheKey, toolCall) {
 function localAgentCreateOptions(input) {
   return {
     apiKey: input.apiKey,
-    model: sdkModelSelection(input.model),
+    model: sdkModelSelection(input.model, input.modelParams),
     name: "API for Cursor local bridge",
     local: {
       cwd: input.workingDirectory
@@ -413,7 +417,7 @@ function localAgentCreateOptions(input) {
 
 function localAgentSendOptions(input, optionsInput = {}) {
   const options = {
-    model: sdkModelSelection(input.model)
+    model: sdkModelSelection(input.model, input.modelParams)
   };
   if (optionsInput.force === true) {
     options.local = { force: true };
@@ -1976,9 +1980,11 @@ function clientMcpInputSchema(parameters) {
 }
 
 function agentCacheKey(input) {
+  const selection = sdkModelSelection(input.model, input.modelParams);
+  const paramsKey = JSON.stringify(selection.params ?? []);
   const digest = crypto
     .createHash("sha256")
-    .update([input.apiKey, input.model, input.workingDirectory, input.sessionKey].join("\0"))
+    .update([input.apiKey, selection.id, paramsKey, input.workingDirectory, input.sessionKey].join("\0"))
     .digest("hex")
     .slice(0, 32);
   return digest;
@@ -2009,17 +2015,69 @@ function normalizeModel(model) {
   if (normalized === "grok-4.6-fast" || normalized === "grok-4-6-fast") return "grok-4.6-fast";
   if (normalized === "grok-4.5" || normalized === "grok-4-5") return "grok-4.5";
   if (normalized === "grok-4.5-fast" || normalized === "grok-4-5-fast") return "grok-4.5-fast";
+  // Effort / fast suffixes are normally resolved upstream; still strip common variants here
+  // so a bare bridge call with grok-4.6-high-fast lands on the grok-4.6 SDK id.
+  const stripped = stripModelVariantSuffixes(normalized);
+  if (stripped === "grok-4.6" || stripped === "grok-4-6") return normalized.includes("fast") ? "grok-4.6-fast" : "grok-4.6";
+  if (stripped === "grok-4.5" || stripped === "grok-4-5") return normalized.includes("fast") ? "grok-4.5-fast" : "grok-4.5";
+  if (stripped === "composer-2.5" || stripped === "composer-2-5") return normalized.includes("fast") ? "composer-2.5-fast" : "composer-2.5";
   return raw;
 }
 
-function sdkModelSelection(model) {
+function stripModelVariantSuffixes(normalized) {
+  let rest = normalized;
+  if (rest.endsWith("-fast")) rest = rest.slice(0, -5);
+  for (const suffix of ["-extra-high", "-extra_high", "-xhigh", "-minimal", "-medium", "-none", "-low", "-high", "-max"]) {
+    if (rest.endsWith(suffix)) {
+      rest = rest.slice(0, -suffix.length);
+      break;
+    }
+  }
+  return rest;
+}
+
+function parseModelParams(value) {
+  if (!Array.isArray(value)) return [];
+  const params = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const id = typeof item.id === "string" ? item.id.trim() : "";
+    const paramValue = typeof item.value === "string" ? item.value.trim() : "";
+    if (!id || !paramValue) continue;
+    params.push({ id, value: paramValue });
+  }
+  return params;
+}
+
+function sdkModelSelection(model, modelParams = []) {
   const normalized = normalizeModel(typeof model === "string" ? model : "");
+  const base = defaultSdkModelSelection(normalized);
+  const overrides = Array.isArray(modelParams) ? modelParams : [];
+  if (!overrides.length) return base;
+
+  const byId = new Map((base.params ?? []).map((param) => [param.id, param]));
+  for (const param of overrides) {
+    if (!param?.id || typeof param.value !== "string") continue;
+    byId.set(param.id, { id: param.id, value: param.value });
+  }
+  return {
+    id: base.id,
+    params: [...byId.values()]
+  };
+}
+
+function defaultSdkModelSelection(normalized) {
   if (normalized === "composer-2.5") return { id: "composer-2.5", params: [{ id: "fast", value: "false" }] };
   if (normalized === "composer-2.5-fast") return { id: "composer-2.5", params: [{ id: "fast", value: "true" }] };
   if (normalized === "grok-4.6") return { id: "grok-4.6", params: [{ id: "fast", value: "false" }] };
   if (normalized === "grok-4.6-fast") return { id: "grok-4.6", params: [{ id: "fast", value: "true" }] };
   if (normalized === "grok-4.5") return { id: "grok-4.5", params: [{ id: "fast", value: "false" }] };
   if (normalized === "grok-4.5-fast") return { id: "grok-4.5", params: [{ id: "fast", value: "true" }] };
+  // Prefer the stripped base id for unknown variant-encoded strings.
+  if (typeof normalized === "string") {
+    const stripped = stripModelVariantSuffixes(normalized.toLowerCase().split("/").filter(Boolean).at(-1) || normalized);
+    if (stripped && stripped !== normalized) return { id: stripped };
+  }
   return { id: normalized };
 }
 

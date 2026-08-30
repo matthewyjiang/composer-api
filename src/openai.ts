@@ -1,4 +1,5 @@
 import { HttpError } from "./http.js";
+import { reasoningEffortFromBody, resolveCursorModel, type ResolvedCursorModel } from "./models.js";
 import { encodeSse } from "./sse.js";
 import type { CursorImage, CursorPrompt, CursorToolCall } from "./types.js";
 
@@ -6,7 +7,7 @@ export type ApiKind = "chat" | "responses";
 
 export interface PreparedRequest {
   model: string;
-  cursorModel?: { id: string };
+  cursorModel?: ResolvedCursorModel;
   prompt: CursorPrompt;
   stream: boolean;
   includeUsage: boolean;
@@ -122,7 +123,7 @@ const AGENT_MODE_PRIMER = [
   "ASSISTANT: Great, I've switched to agent mode."
 ];
 
-export function prepareChatRequest(body: unknown, cursorModel: { id: string } | undefined, options: { forceAgentMode?: boolean } = {}): PreparedRequest {
+export function prepareChatRequest(body: unknown, _cursorModel?: ResolvedCursorModel, options: { forceAgentMode?: boolean } = {}): PreparedRequest {
   const record = expectRecord(body, "body");
   const messages = expectArray(record.messages, "messages");
   validateCommonUnsupported(record);
@@ -134,6 +135,7 @@ export function prepareChatRequest(body: unknown, cursorModel: { id: string } | 
   const toolContext = toolCallContextFromMessages(messages);
   const agentMode = options.forceAgentMode === true || tools.length > 0;
   const model = typeof record.model === "string" && record.model.trim() ? record.model.trim() : "composer-2.5";
+  const cursorModel = resolveCursorModel(model, { reasoningEffort: reasoningEffortFromBody(record) });
   const latestUserText = latestUserTextFromMessages(messages);
   const workspaceMutationRequired = shouldRequireLocalTool(latestUserText, tools);
   const workspaceMutationDone = workspaceMutationRequired && hasRequiredLocalToolCall(messages, tools, latestUserText);
@@ -171,7 +173,8 @@ export function prepareChatRequest(body: unknown, cursorModel: { id: string } | 
     promptChars: text.length,
     responseMetadata: {
       temperature: numberOrNull(record.temperature),
-      top_p: numberOrNull(record.top_p)
+      top_p: numberOrNull(record.top_p),
+      reasoning: { effort: cursorModel.reasoningEffort, summary: null }
     },
     tools,
     requiresLocalTool: false,
@@ -180,7 +183,7 @@ export function prepareChatRequest(body: unknown, cursorModel: { id: string } | 
   };
 }
 
-export function prepareOpencodeSdkChatRequest(body: unknown, cursorModel: { id: string } | undefined): PreparedRequest {
+export function prepareOpencodeSdkChatRequest(body: unknown, _cursorModel?: ResolvedCursorModel): PreparedRequest {
   const record = expectRecord(body, "body");
   const messages = expectArray(record.messages, "messages");
   validateCommonUnsupported(record);
@@ -191,6 +194,7 @@ export function prepareOpencodeSdkChatRequest(body: unknown, cursorModel: { id: 
   const tools = record.tool_choice === "none" ? [] : parseChatTools(record.tools);
   const toolContext = toolCallContextFromMessages(messages);
   const model = typeof record.model === "string" && record.model.trim() ? record.model.trim() : "composer-2.5";
+  const cursorModel = resolveCursorModel(model, { reasoningEffort: reasoningEffortFromBody(record) });
   const latestUserText = latestUserTextFromMessages(messages);
   const workspaceMutationRequired = shouldRequireLocalTool(latestUserText, tools);
   const workspaceMutationDone = workspaceMutationRequired && hasRequiredLocalToolCall(messages, tools, latestUserText);
@@ -240,7 +244,8 @@ export function prepareOpencodeSdkChatRequest(body: unknown, cursorModel: { id: 
     promptChars: text.length,
     responseMetadata: {
       temperature: numberOrNull(record.temperature),
-      top_p: numberOrNull(record.top_p)
+      top_p: numberOrNull(record.top_p),
+      reasoning: { effort: cursorModel.reasoningEffort, summary: null }
     },
     tools,
     requiresLocalTool: workspaceMutationRequired && !workspaceMutationDone,
@@ -251,7 +256,7 @@ export function prepareOpencodeSdkChatRequest(body: unknown, cursorModel: { id: 
 
 export function prepareResponsesRequest(
   body: unknown,
-  cursorModel: { id: string } | undefined,
+  _cursorModel?: ResolvedCursorModel,
   options: { previousOutput?: unknown[]; previousInputItems?: unknown[] } = {}
 ): PreparedRequest {
   const record = expectRecord(body, "body");
@@ -263,6 +268,7 @@ export function prepareResponsesRequest(
   const tools = record.tool_choice === "none" ? [] : parseChatTools(record.tools);
   const toolContext = toolCallContextFromResponseInput(record.input, record.instructions);
   const model = typeof record.model === "string" && record.model.trim() ? record.model.trim() : "composer-2.5";
+  const cursorModel = resolveCursorModel(model, { reasoningEffort: reasoningEffortFromBody(record) });
   const latestUserText = latestUserTextFromResponseInput(record.input);
   const workspaceMutationRequired = shouldRequireLocalTool(latestUserText, tools);
   const workspaceMutationDone = workspaceMutationRequired && hasRequiredResponseLocalToolCall(record.input, tools, latestUserText);
@@ -296,6 +302,7 @@ export function prepareResponsesRequest(
       text: isRecord(record.text) ? record.text : { format: { type: "text" } },
       previous_response_id: previousResponseId || null,
       store: storeResponse,
+      reasoning: { effort: cursorModel.reasoningEffort, summary: null },
       ...(tools.length ? { tools: responseToolMetadata(tools), tool_choice: responseToolChoiceMetadata(record.tool_choice) } : {})
     },
     tools,
