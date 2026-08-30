@@ -37,6 +37,12 @@ export interface ServiceStatusResult {
   detail: string;
 }
 
+export interface ServiceRestartResult {
+  unitPath: string;
+  restarted: boolean;
+  detail: string;
+}
+
 function userUnitDir(env: NodeJS.ProcessEnv, home: string): string {
   return path.join(configHome(env, home), "systemd", "user");
 }
@@ -148,6 +154,27 @@ export async function uninstallUserService(options: ServiceCommandOptions = {}):
     unitPath,
     enabled: false,
     detail: `Stopped and removed ${SERVICE_UNIT}`
+  };
+}
+
+export async function restartUserService(options: ServiceCommandOptions = {}): Promise<ServiceRestartResult> {
+  const env = options.env ?? process.env;
+  const home = options.home ?? os.homedir();
+  const unitPath = userUnitPath(env, home);
+  const run = options.run ?? runCommand;
+  const restart = await runSystemctl(run, ["restart", SERVICE_UNIT]);
+  if (restart.code !== 0) {
+    const stderr = restart.stderr.trim() || restart.stdout.trim() || `exit ${restart.code}`;
+    return {
+      unitPath,
+      restarted: false,
+      detail: `Could not restart ${SERVICE_UNIT}: ${stderr}\nUnit file: ${unitPath}`
+    };
+  }
+  return {
+    unitPath,
+    restarted: true,
+    detail: `Restarted ${SERVICE_UNIT}`
   };
 }
 

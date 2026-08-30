@@ -7,6 +7,7 @@ import {
   renderUserServiceUnit,
   SERVICE_UNIT,
   systemdQuote,
+  restartUserService,
   uninstallUserService,
   userServiceStatus,
   userUnitPath,
@@ -122,6 +123,32 @@ describe("user service", () => {
       ["systemctl", "--user", "daemon-reload"]
     ]);
     await expect(readFile(unitPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("restarts the unit with systemctl --user", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "cursor-api-service-"));
+    const env = envFor(home);
+    const calls: string[][] = [];
+    const result = await restartUserService({
+      home,
+      env,
+      run: recordingRun(calls)
+    });
+    expect(result.restarted).toBe(true);
+    expect(result.detail).toContain("Restarted");
+    expect(calls).toEqual([["systemctl", "--user", "restart", SERVICE_UNIT]]);
+  });
+
+  it("reports restart failure", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "cursor-api-service-"));
+    const env = envFor(home);
+    const result = await restartUserService({
+      home,
+      env,
+      run: recordingRun([], [{ code: 1, stdout: "", stderr: "Unit not found" }])
+    });
+    expect(result.restarted).toBe(false);
+    expect(result.detail).toContain("Unit not found");
   });
 
   it("reports systemctl --user status output", async () => {
