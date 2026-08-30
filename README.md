@@ -14,11 +14,15 @@ git clone https://github.com/standardagents/composer-api.git
 cd composer-api
 bun install
 
-# 2. Save your Cursor API key (stored in ~/.config/api-for-cursor/config.json)
-bun src/cli.ts set-key your-cursor-key
+# 2. Install the `cursor-api` command globally
+bun run build
+bun link && bun link api-for-cursor
 
-# 3. Start the server
-bun src/cli.ts serve
+# 3. Save your Cursor API key (stored in ~/.config/api-for-cursor/config.json)
+cursor-api set-key your-cursor-key
+
+# 4. Start the server
+cursor-api serve
 ```
 
 That's it. The API is now running at `http://127.0.0.1:8787/v1`.
@@ -51,17 +55,17 @@ const completion = await client.chat.completions.create({
 To set up a coding agent (opencode, codex, vscode, cline, kilo, or pi) to use the local server automatically:
 
 ```bash
-bun src/cli.ts setup          # configure all of them
-bun src/cli.ts setup opencode # or just one
+cursor-api setup          # configure all of them
+cursor-api setup opencode # or just one
 ```
 
 ## Commands
 
 ```bash
-bun src/cli.ts serve [--host 127.0.0.1] [--port 8787] [--key KEY]
-bun src/cli.ts set-key <cursor-api-key>
-bun src/cli.ts setup [opencode|codex|vscode|cline|kilo|pi|all]
-bun src/cli.ts models
+cursor-api serve [--host 127.0.0.1] [--port 8787] [--key KEY]
+cursor-api set-key <cursor-api-key>
+cursor-api setup [opencode|codex|vscode|cline|kilo|pi|all]
+cursor-api models
 ```
 
 Instead of `set-key`, you can also set the key in your environment:
@@ -72,15 +76,15 @@ export CURSOR_API_KEY="your-cursor-key"
 
 ## Using Node instead of Bun
 
-Node needs a build step first (Node 22.6 or newer):
+With Node 22.6 or newer:
 
 ```bash
 npm install
 npm run build
-node dist/cli.js serve
+npm link
 ```
 
-Every `bun src/cli.ts <command>` above works as `node dist/cli.js <command>`.
+`npm link` installs the same global `cursor-api` command, so everything above works unchanged.
 
 ## Models
 

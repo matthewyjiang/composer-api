@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { realpathSync } from "node:fs";
 import { createServer } from "node:http";
 import { createConnection } from "node:net";
 import { pathToFileURL } from "node:url";
@@ -209,7 +210,9 @@ async function waitForHealth(url: string): Promise<void> {
   throw new Error("Cursor SDK bridge did not become ready.");
 }
 
-const isMain = process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url;
+// Resolve symlinks so this still matches when run through a linked bin (e.g. `bun link` / `npm link`).
+const argvPath = process.argv[1] ? realpathSync(process.argv[1]) : undefined;
+const isMain = argvPath && pathToFileURL(argvPath).href === import.meta.url;
 if (isMain) {
   main().then(
     (code) => {
