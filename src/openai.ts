@@ -174,10 +174,14 @@ export function prepareChatRequest(body: unknown, _cursorModel?: ResolvedCursorM
   }
   appendChatOptions(transcript, record);
   const text = transcript.join("\n");
+  const incrementalPrompt = chatContinuationPrompt(messages, tools, "chat", {
+    workspaceMutationRequired
+  });
   return {
     model,
     cursorModel,
     prompt: { text, mode: agentMode ? "agent" : "ask", ...(images.length ? { images } : {}) },
+    ...(incrementalPrompt ? { incrementalPrompt } : {}),
     stream: record.stream === true,
     includeUsage: includeStreamUsage(record),
     promptChars: text.length,
@@ -248,10 +252,15 @@ export function prepareOpencodeSdkChatRequest(body: unknown, _cursorModel?: Reso
   }
   appendChatOptions(transcript, record);
   const text = transcript.join("\n");
+  const incrementalPrompt = chatContinuationPrompt(messages, tools, "opencode", {
+    workspaceMutationRequired,
+    toolCallById
+  });
   return {
     model,
     cursorModel,
     prompt: { text, mode: "agent", ...(images.length ? { images } : {}) },
+    ...(incrementalPrompt ? { incrementalPrompt } : {}),
     stream: record.stream === true,
     includeUsage: includeStreamUsage(record),
     promptChars: text.length,
@@ -899,6 +908,7 @@ function appendChatTools(transcript: string[], tools: OpenAiToolSpec[], toolChoi
 
 function appendResponsesToolInventory(transcript: string[], tools: OpenAiToolSpec[], toolChoice: unknown, context?: ToolCallContext) {
   if (!tools.length) return;
+  const routes = sdkRoutingRecords(tools, context);
   transcript.push(
     "",
     "LOCAL TOOL INVENTORY:",
@@ -912,10 +922,8 @@ function appendResponsesToolInventory(transcript: string[], tools: OpenAiToolSpe
   if (hasCompatibleTool("shell", tools)) {
     transcript.push("A shell client tool is available. For general file creation or overwrite requests, prefer an SDK shell call using mkdir -p and a quoted heredoc.");
   }
-  for (const tool of tools) {
-    transcript.push(JSON.stringify(toolInventoryRecord(tool, { includeSdkMcp: true })));
-  }
-  appendSdkRoutingMap(transcript, tools, context);
+  appendCompactToolRecords(transcript, tools, routes, { includeSdkMcp: true });
+  appendSdkRoutingMap(transcript, routes);
   const selected = toolChoiceFunctionName(toolChoice);
   if (selected) {
     transcript.push(requestedToolHint(selected));
@@ -926,6 +934,7 @@ function appendResponsesToolInventory(transcript: string[], tools: OpenAiToolSpe
 
 function appendSdkToolInventory(transcript: string[], tools: OpenAiToolSpec[], toolChoice: unknown, context?: ToolCallContext) {
   if (!tools.length) return;
+  const routes = sdkRoutingRecords(tools, context);
   transcript.push(
     "",
     "OPENCODE TOOL INVENTORY:",
@@ -936,10 +945,8 @@ function appendSdkToolInventory(transcript: string[], tools: OpenAiToolSpec[], t
     "When the user names a specific allowed client tool, use the matching SDK TOOL ROUTING MAP route and do not substitute a different tool.",
     "For general local work, prefer shell/read/write/edit/glob/grep/ls style tool requests when those capabilities are present."
   );
-  for (const tool of tools) {
-    transcript.push(JSON.stringify(toolInventoryRecord(tool, { includeSdkMcp: true })));
-  }
-  appendSdkRoutingMap(transcript, tools, context);
+  appendCompactToolRecords(transcript, tools, routes, { includeSdkMcp: true });
+  appendSdkRoutingMap(transcript, routes);
   if (isRecord(toolChoice) && toolChoice.type === "function" && isRecord(toolChoice.function) && typeof toolChoice.function.name === "string") {
     transcript.push(requestedToolHint(toolChoice.function.name));
   } else if (toolChoice === "required") {
@@ -947,8 +954,7 @@ function appendSdkToolInventory(transcript: string[], tools: OpenAiToolSpec[], t
   }
 }
 
-function appendSdkRoutingMap(transcript: string[], tools: OpenAiToolSpec[], context?: ToolCallContext) {
-  const routes = sdkRoutingRecords(tools, context);
+function appendSdkRoutingMap(transcript: string[], routes: Record<string, unknown>[]) {
   if (!routes.length) return;
   transcript.push(
     "SDK TOOL ROUTING MAP:",
@@ -956,6 +962,26 @@ function appendSdkRoutingMap(transcript: string[], tools: OpenAiToolSpec[], cont
   );
   for (const route of routes) {
     transcript.push(JSON.stringify(route));
+  }
+}
+
+function appendCompactToolRecords(
+  transcript: string[],
+  tools: OpenAiToolSpec[],
+  routes: Record<string, unknown>[],
+  options: { includeSdkMcp: boolean }
+) {
+  const routedClients = new Set(
+    routes.flatMap((route) => (
+      typeof route.client === "string" && route.sdk !== "mcp" ? [route.client] : []
+    ))
+  );
+  for (const tool of tools) {
+    transcript.push(JSON.stringify(
+      routedClients.has(tool.name)
+        ? routedToolInventoryRecord(tool)
+        : toolInventoryRecord(tool, options)
+    ));
   }
 }
 
@@ -1006,10 +1032,11 @@ function sdkRoutingSamples(): CursorToolCall[] {
 
 function toolInventoryRecord(tool: OpenAiToolSpec, options: { includeSdkMcp: boolean }): Record<string, unknown> {
   const target = options.includeSdkMcp ? mcpTargetForClientToolName(tool.name, { includeMapped: false }) : undefined;
+  const description = compactToolDescription(tool.description);
   return {
     name: tool.name,
-    ...(tool.description ? { description: tool.description } : {}),
-    ...(tool.parameters !== undefined ? { parameters: tool.parameters } : {}),
+    ...(description ? { description } : {}),
+    ...(tool.parameters !== undefined ? { parameters: compactJsonSchema(tool.parameters) } : {}),
     ...(target
       ? {
           sdk_mcp: {
@@ -1020,6 +1047,52 @@ function toolInventoryRecord(tool: OpenAiToolSpec, options: { includeSdkMcp: boo
         }
       : {})
   };
+}
+
+function routedToolInventoryRecord(tool: OpenAiToolSpec): Record<string, unknown> {
+  const description = compactToolDescription(tool.description);
+  return {
+    name: tool.name,
+    ...(description ? { description } : {}),
+    via: "SDK TOOL ROUTING MAP"
+  };
+}
+
+const TOOL_DESCRIPTION_LIMIT = 160;
+const SCHEMA_NOISE_KEYS = new Set([
+  "$schema",
+  "$id",
+  "$comment",
+  "title",
+  "examples",
+  "default",
+  "markdownDescription"
+]);
+
+function compactToolDescription(description: string | undefined): string | undefined {
+  if (typeof description !== "string") return undefined;
+  const trimmed = description.replace(/\s+/g, " ").trim();
+  if (!trimmed) return undefined;
+  return trimmed.length > TOOL_DESCRIPTION_LIMIT ? `${trimmed.slice(0, TOOL_DESCRIPTION_LIMIT - 3)}...` : trimmed;
+}
+
+function compactJsonSchema(value: unknown, depth = 0): unknown {
+  if (Array.isArray(value)) return value.map((item) => compactJsonSchema(item, depth + 1));
+  if (!isRecord(value)) return value;
+  const compact: Record<string, unknown> = {};
+  for (const [key, nested] of Object.entries(value)) {
+    if (SCHEMA_NOISE_KEYS.has(key)) continue;
+    if (key === "description") {
+      if (depth === 0) {
+        const description = compactToolDescription(typeof nested === "string" ? nested : undefined);
+        if (description) compact.description = description;
+      }
+      continue;
+    }
+    if (key === "additionalProperties" && nested === true) continue;
+    compact[key] = compactJsonSchema(nested, depth + 1);
+  }
+  return compact;
 }
 
 function directToolChoiceHint(toolName: string): string {
@@ -1234,6 +1307,52 @@ function responsesContinuationPrompt(input: unknown, tools: OpenAiToolSpec[]): {
     ].join("\n"),
     images
   };
+}
+
+export function incrementalContinuationPrompt(input: unknown, tools: OpenAiToolSpec[] = []): string | undefined {
+  return responsesContinuationPrompt(input, tools).text;
+}
+
+function chatContinuationPrompt(
+  messages: unknown[],
+  tools: OpenAiToolSpec[],
+  flavor: "chat" | "opencode",
+  options: {
+    workspaceMutationRequired?: boolean;
+    toolCallById?: Map<string, { name: string; args: Record<string, unknown> }>;
+  } = {}
+): string | undefined {
+  const items = messages.map((message) => expectRecord(message, "messages[]"));
+  let start = 0;
+  for (let index = 0; index < items.length; index += 1) {
+    if (items[index].role === "assistant") start = index + 1;
+  }
+  if (start === 0 || start >= items.length) return undefined;
+  const lines = [
+    "This Cursor session already has the earlier conversation. Continue from this new input only:",
+    ""
+  ];
+  const toolCallById = options.toolCallById ?? new Map<string, { name: string; args: Record<string, unknown> }>();
+  for (const item of items.slice(start)) {
+    const role = typeof item.role === "string" ? item.role : "user";
+    const { text } = contentToTextAndImages(item.content, role);
+    if (role === "tool") {
+      const toolCallId = typeof item.tool_call_id === "string" ? item.tool_call_id : "";
+      const toolName = typeof item.name === "string" ? item.name : "";
+      const label = [toolName ? `name=${toolName}` : "", toolCallId ? `tool_call_id=${toolCallId}` : ""].filter(Boolean).join(" ");
+      lines.push(`TOOL RESULT${label ? ` (${label})` : ""}: ${text || "[empty]"}`);
+      if (flavor === "opencode") {
+        lines.push(`LOCAL OPENCODE TOOL RESULT: ${JSON.stringify(sdkToolResultFeedback(toolCallId, toolName, text, toolCallById, tools))}`);
+      }
+    } else {
+      const body = options.workspaceMutationRequired && role === "user" ? addWorkspaceActionToUserText(text) : text;
+      lines.push(`${role.toUpperCase()}: ${body || "[empty]"}`);
+    }
+    if (Array.isArray(item.tool_calls)) {
+      lines.push(`${role.toUpperCase()} TOOL_CALLS: ${JSON.stringify(item.tool_calls)}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 export function functionCallOutputsFromInput(input: unknown): FunctionCallOutput[] {

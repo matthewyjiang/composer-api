@@ -139,6 +139,37 @@ describe("OpenAI compatibility adapter", () => {
     expect(prepared.prompt.text).toContain('"name":"glob"');
   });
 
+  it("strips nested schema noise from chat tool inventory", () => {
+    const nested = "very long nested description for pattern matching";
+    const prepared = prepareChatRequest(
+      {
+        model: "composer-2.5",
+        messages: [{ role: "user", content: "list files" }],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "glob",
+              description: "Find files",
+              parameters: {
+                type: "object",
+                $schema: "https://json-schema.org/draft/2020-12/schema",
+                properties: {
+                  pattern: { type: "string", description: nested }
+                }
+              }
+            }
+          }
+        ]
+      },
+      { id: "composer-2.5" }
+    );
+    expect(prepared.prompt.text).toContain('"name":"glob"');
+    expect(prepared.prompt.text).toContain('"pattern"');
+    expect(prepared.prompt.text).not.toContain(nested);
+    expect(prepared.prompt.text).not.toContain("json-schema.org");
+  });
+
   it("accepts bare harness tools with input_schema and maps SDK glob arguments to that schema", () => {
     const prepared = prepareOpencodeSdkChatRequest(
       {
@@ -824,6 +855,8 @@ describe("OpenAI compatibility adapter", () => {
       ]
     });
 
+    expect(prepared.prompt.text).toContain('"via":"SDK TOOL ROUTING MAP"');
+    expect(prepared.prompt.text).not.toContain("The absolute path to the file to write");
     expect(generated.map((call) => call.function.name)).toEqual(["glob", "bash", "write", "edit", "bash"]);
     expect(generated.map((call) => JSON.parse(call.function.arguments))).toEqual([
       { pattern: "**/*", path: "/tmp/todo-vite" },
@@ -1492,6 +1525,48 @@ describe("OpenAI compatibility adapter", () => {
       input: "hello"
     });
     expect(prepared.incrementalPrompt).toBeUndefined();
+  });
+
+  it("omits incrementalPrompt on a fresh chat request", () => {
+    const prepared = prepareChatRequest({
+      model: "composer-2.5",
+      messages: [{ role: "user", content: "Hello" }]
+    });
+    expect(prepared.incrementalPrompt).toBeUndefined();
+  });
+
+  it("sets a continuation incrementalPrompt from new chat messages only", () => {
+    const prepared = prepareChatRequest({
+      model: "composer-2.5",
+      messages: [
+        { role: "user", content: "what is this repo?" },
+        { role: "assistant", content: "I will inspect it." },
+        { role: "user", content: "start with README.md" }
+      ]
+    });
+    expect(prepared.incrementalPrompt).toContain("Continue from this new input only:");
+    expect(prepared.incrementalPrompt).toContain("start with README.md");
+    expect(prepared.incrementalPrompt).not.toContain("what is this repo?");
+    expect(prepared.prompt.text).toContain("what is this repo?");
+  });
+
+  it("sets a continuation incrementalPrompt from chat tool results", () => {
+    const prepared = prepareChatRequest({
+      model: "composer-2.5",
+      messages: [
+        { role: "user", content: "read README.md" },
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [{ id: "call_1", type: "function", function: { name: "read_file", arguments: "{\"path\":\"README.md\"}" } }]
+        },
+        { role: "tool", tool_call_id: "call_1", name: "read_file", content: "# API for Cursor" }
+      ],
+      tools: [{ type: "function", function: { name: "read_file", parameters: { type: "object", properties: { path: { type: "string" } } } } }]
+    });
+    expect(prepared.incrementalPrompt).toContain("TOOL RESULT");
+    expect(prepared.incrementalPrompt).toContain("# API for Cursor");
+    expect(prepared.incrementalPrompt).not.toContain("read README.md");
   });
 
   it("converts Responses input arrays", () => {

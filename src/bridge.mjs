@@ -316,7 +316,7 @@ async function startFreshLocalAgentRun(input, onRun, onEvent) {
   }
   const prompt = reuseCache ? input.incrementalPrompt : input.prompt;
   const pending = createPendingRun(input, agentEntry, runToken);
-  const sendInput = { ...input, runToken };
+  const sendInput = { ...input, runToken, mcpToken: agentEntry.mcpToken };
   try {
     const run = await agentEntry.agent.send(prompt, {
       ...localAgentSendOptions(sendInput),
@@ -361,11 +361,13 @@ function createPendingRun(input, agentEntry, runToken) {
     evicted: false,
     createdAt: Date.now(),
     consumer: null,
+    mcpToken: agentEntry.mcpToken,
     notifyParked: null,
     consumeLoop: null
   };
   pendingRunsBySession.set(input.sessionKey, pending);
   pendingRunsByToken.set(runToken, pending);
+  if (agentEntry.mcpToken) pendingRunsByToken.set(agentEntry.mcpToken, pending);
   return pending;
 }
 
@@ -490,8 +492,8 @@ function ingestClientToolCall(body, response) {
     ? body.callId.trim()
     : crypto.randomUUID();
   const args = isRecord(body.arguments) ? body.arguments : {};
-  const pending = pendingRunsByToken.get(runToken);
-  if (!runToken || !toolName || !pending || pending.evicted) {
+  const pending = pendingRunForCallback(runToken, body.cacheKey);
+  if (!toolName || !pending || pending.evicted) {
     return { accepted: false, callId };
   }
   const normalized = normalizeSDKToolCall({ type: toolName, args }, pending.input.clientTools);
@@ -508,7 +510,7 @@ function ingestClientToolCall(body, response) {
   }, currentParkedCallTimeoutMs());
   parkedMcpCalls.set(callId, {
     callId,
-    runToken,
+    runToken: pending.runToken,
     toolCall,
     response,
     timeout,
@@ -590,6 +592,18 @@ function forgetPendingRun(pending) {
   if (pendingRunsByToken.get(pending.runToken) === pending) {
     pendingRunsByToken.delete(pending.runToken);
   }
+  if (pending.mcpToken && pendingRunsByToken.get(pending.mcpToken) === pending) {
+    pendingRunsByToken.delete(pending.mcpToken);
+  }
+}
+
+function pendingRunForCallback(runToken, cacheKeyValue) {
+  if (runToken && pendingRunsByToken.has(runToken)) {
+    return pendingRunsByToken.get(runToken);
+  }
+  const cacheKey = typeof cacheKeyValue === "string" ? cacheKeyValue.trim() : "";
+  if (!cacheKey) return undefined;
+  return [...pendingRunsBySession.values()].find((pending) => pending.cacheKey === cacheKey && !pending.evicted);
 }
 
 async function getAgent(input) {
@@ -597,13 +611,14 @@ async function getAgent(input) {
   const cached = agentCache.get(cacheKey);
   if (cached) {
     cached.touchedAt = Date.now();
-    return { agent: cached.agent, cacheKey, cached: true };
+    return { agent: cached.agent, cacheKey, cached: true, mcpToken: cached.mcpToken };
   }
 
-  const agent = await createAgentImpl(input);
-  agentCache.set(cacheKey, { agent, touchedAt: Date.now() });
+  const mcpToken = crypto.randomUUID();
+  const agent = await createAgentImpl({ ...input, mcpToken });
+  agentCache.set(cacheKey, { agent, touchedAt: Date.now(), mcpToken });
   evictAgents();
-  return { agent, cacheKey, cached: false };
+  return { agent, cacheKey, cached: false, mcpToken };
 }
 
 async function defaultCreateAgent(input) {
@@ -628,7 +643,7 @@ function evictCachedAgent(input) {
 }
 
 function localAgentCreateOptions(input) {
-  return {
+  const options = {
     apiKey: input.apiKey,
     model: sdkModelSelection(input.model, input.modelParams),
     name: "API for Cursor local bridge",
@@ -641,6 +656,16 @@ function localAgentCreateOptions(input) {
     // surfacing as OpenAI function_calls, mutating the workspace invisibly.
     tools: ["mcp"]
   };
+  // Attach MCP at create so the stdio child can stay warm across send() calls.
+  // Env must stay byte-identical to send options or the SDK respawns it.
+  if ((input.clientTools || []).length > 0) {
+    options.mcpServers = clientForwardingMcpServers(
+      input.clientTools,
+      agentCacheKey(input),
+      stableMcpToken(input)
+    );
+  }
+  return options;
 }
 
 function localAgentSendOptions(input, optionsInput = {}) {
@@ -650,10 +675,18 @@ function localAgentSendOptions(input, optionsInput = {}) {
   if (optionsInput.force === true) {
     options.local = { force: true };
   }
-  if (input.clientTools.length > 0) {
-    options.mcpServers = clientForwardingMcpServers(input.clientTools, agentCacheKey(input), input.runToken || "");
+  if ((input.clientTools || []).length > 0) {
+    options.mcpServers = clientForwardingMcpServers(
+      input.clientTools,
+      agentCacheKey(input),
+      stableMcpToken(input)
+    );
   }
   return options;
+}
+
+function stableMcpToken(input) {
+  return input.mcpToken || "";
 }
 
 function clientToolsNeedingMcp(clientTools = []) {

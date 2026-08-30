@@ -134,6 +134,8 @@ Allowed Grok 4.5 efforts: `low`, `medium`, `high`.
 
 Equivalent model ids also work, for example `grok-4.6-high-fast` or `grok-4.6-xhigh`. Body `reasoning_effort` / `reasoning.effort` overrides effort encoded in the model id. Composer models do not support effort.
 
+For lower time-to-first-token, prefer the `*-fast` model ids (`composer-2.5-fast`, `grok-4.6-fast`). Follow-up turns should send `previous_response_id` or `x-session-affinity` so the local Cursor agent can be reused instead of rebuilt.
+
 ## Supported endpoints
 
 - `POST /v1/chat/completions`

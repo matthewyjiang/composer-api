@@ -354,6 +354,69 @@ describe("local OpenAI server", () => {
     expect(keys[0]).toBe(keys[1]);
   });
 
+  it("passes incrementalPrompt when correlating by structural item prefix", async () => {
+    _resetResponseStateForTests();
+    const calls: Array<{ incrementalPrompt?: string; sessionKey: string }> = [];
+    let turn = 0;
+    const ctx = createContext(config(), { url: "http://127.0.0.1:8792/sdk", token: "bridge" }, {
+      now: () => new Date("2026-08-12T00:00:00Z"),
+      randomUUID: () => "00000000-0000-4000-8000-00000000000" + String(calls.length + 1),
+      runSdk: async function* (_settings, input) {
+        calls.push({ incrementalPrompt: input.incrementalPrompt, sessionKey: input.sessionKey });
+        turn += 1;
+        if (turn === 1) {
+          yield { type: "tool_call", toolCall: { id: "call_prefix_1", name: "read", arguments: { path: "AGENTS.md" } } };
+          yield { type: "done", finalText: "", toolCalls: [{ id: "call_prefix_1", name: "read", arguments: { path: "AGENTS.md" } }] };
+          return;
+        }
+        yield { type: "text", text: "ok" };
+        yield { type: "done", finalText: "ok", toolCalls: [] };
+      }
+    });
+    const tools = [
+      {
+        type: "function",
+        name: "read_file",
+        parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+      }
+    ];
+    const first = await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          input: [{ type: "message", role: "user", content: "unique prefix incremental zzz" }],
+          tools
+        })
+      }),
+      ctx
+    );
+    const created = await first.json() as { output: Array<{ type?: string; call_id?: string; name?: string; arguments?: string }> };
+    const functionCall = created.output.find((item) => item.type === "function_call");
+    await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          input: [
+            { type: "message", role: "user", content: "unique prefix incremental zzz" },
+            functionCall,
+            { type: "function_call_output", call_id: functionCall?.call_id, output: "docs" }
+          ],
+          tools
+        })
+      }),
+      ctx
+    );
+    expect(calls).toHaveLength(2);
+    expect(calls[0].sessionKey).toBe(calls[1].sessionKey);
+    expect(calls[0].incrementalPrompt).toBeUndefined();
+    expect(calls[1].incrementalPrompt).toContain("docs");
+    expect(calls[1].incrementalPrompt).not.toContain("unique prefix incremental zzz");
+  });
+
   it("reuses a conversation session key across Responses turns without previous_response_id", async () => {
     _resetResponseStateForTests();
     const keys: string[] = [];
@@ -380,6 +443,90 @@ describe("local OpenAI server", () => {
     expect(keys).toHaveLength(2);
     expect(keys[0]).toBe(keys[1]);
     expect(keys[0]).toMatch(/^conv_/);
+  });
+
+  it("does not collapse agent-mode chat sessions onto the primer user line", async () => {
+    _resetResponseStateForTests();
+    const keys: string[] = [];
+    const tools = [
+      {
+        type: "function",
+        function: {
+          name: "read_file",
+          parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+        }
+      }
+    ];
+    const ctx = createContext(config(), { url: "http://127.0.0.1:8792/sdk", token: "bridge" }, {
+      now: () => new Date("2026-08-12T00:00:00Z"),
+      randomUUID: () => "00000000-0000-4000-8000-00000000000" + String(keys.length + 1),
+      runSdk: async function* (_settings, input) {
+        keys.push(input.sessionKey);
+        yield { type: "text", text: "ok" };
+        yield { type: "done", finalText: "ok", toolCalls: [] };
+      }
+    });
+    for (const content of ["unique agent chat AAAA", "unique agent chat BBBB"]) {
+      await handleRequest(
+        new Request("http://127.0.0.1:8787/v1/chat/completions", {
+          method: "POST",
+          headers: { authorization: "Bearer local", "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "composer-2.5",
+            messages: [{ role: "user", content }],
+            tools
+          })
+        }),
+        ctx
+      );
+    }
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).not.toBe(keys[1]);
+  });
+
+  it("passes incrementalPrompt on chat follow-up turns", async () => {
+    _resetResponseStateForTests();
+    const calls: Array<{ incrementalPrompt?: string; sessionKey: string }> = [];
+    const ctx = createContext(config(), { url: "http://127.0.0.1:8792/sdk", token: "bridge" }, {
+      now: () => new Date("2026-08-12T00:00:00Z"),
+      randomUUID: () => "00000000-0000-4000-8000-00000000000" + String(calls.length + 1),
+      runSdk: async function* (_settings, input) {
+        calls.push({ incrementalPrompt: input.incrementalPrompt, sessionKey: input.sessionKey });
+        yield { type: "text", text: "ok" };
+        yield { type: "done", finalText: "ok", toolCalls: [] };
+      }
+    });
+    await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          messages: [{ role: "user", content: "unique chat seed zzz" }]
+        })
+      }),
+      ctx
+    );
+    await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          messages: [
+            { role: "user", content: "unique chat seed zzz" },
+            { role: "assistant", content: "ok" },
+            { role: "user", content: "and now the next turn" }
+          ]
+        })
+      }),
+      ctx
+    );
+    expect(calls).toHaveLength(2);
+    expect(calls[0].incrementalPrompt).toBeUndefined();
+    expect(calls[0].sessionKey).toBe(calls[1].sessionKey);
+    expect(calls[1].incrementalPrompt).toContain("and now the next turn");
+    expect(calls[1].incrementalPrompt).not.toContain("unique chat seed zzz");
   });
 
   it("passes new Responses input as incrementalPrompt on previous_response_id follow-up", async () => {

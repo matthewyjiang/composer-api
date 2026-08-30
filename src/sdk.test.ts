@@ -115,6 +115,21 @@ describe("runSdkStream", () => {
     expect(body?.toolResults).toEqual([{ call_id: "call_1", output: "README.md" }]);
   });
 
+  it("forwards text immediately when a local tool is required", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    globalThis.fetch = async () =>
+      new Response(ndjsonStream([JSON.stringify({ type: "text", text: "I'll write the file." })], hold), { status: 200 });
+
+    const iterator = runSdkStream(settings, input({ requiresLocalTool: true }))[Symbol.asyncIterator]();
+    const first = await iterator.next();
+    expect(first).toEqual({ done: false, value: { type: "text", text: "I'll write the file." } });
+    release();
+    await iterator.next();
+  });
+
   it("omits incrementalPrompt when it matches the full prompt", async () => {
     let body: Record<string, unknown> | undefined;
     globalThis.fetch = async (_url, init) => {

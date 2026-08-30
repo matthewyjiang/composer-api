@@ -12,7 +12,7 @@ export async function incomingToRequest(req: IncomingMessage, origin: string): P
   return new Request(url, {
     method,
     headers,
-    body: hasBody ? Uint8Array.from(await readIncomingBody(req)) : undefined
+    body: hasBody ? toRequestBody(await readIncomingBody(req)) : undefined
   });
 }
 
@@ -22,6 +22,7 @@ export async function writeNodeResponse(res: ServerResponse, response: Response)
     headers[key] = value;
   });
   res.writeHead(response.status, headers);
+  res.socket?.setNoDelay?.(true);
   res.flushHeaders();
   if (!response.body) {
     res.end();
@@ -40,6 +41,10 @@ export async function writeNodeResponse(res: ServerResponse, response: Response)
   } finally {
     res.end();
   }
+}
+
+function toRequestBody(buffer: Buffer): BodyInit {
+  return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength) as BodyInit;
 }
 
 function readIncomingBody(req: IncomingMessage): Promise<Buffer> {

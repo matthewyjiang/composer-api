@@ -37,6 +37,89 @@ describe("Cursor SDK local-agent bridge", () => {
     expect(hasDistinctIncrementalPrompt("full transcript", "TOOL RESULT: README.md")).toBe(true);
   });
 
+  it("reuses a cached agent when a later turn sends incrementalPrompt", async () => {
+    _resetBridgeStateForTests();
+    let creates = 0;
+    const prompts = [];
+    _setCreateAgentForTests(async () => {
+      creates += 1;
+      return {
+        agentId: `agent-${creates}`,
+        close() {},
+        async send(prompt) {
+          prompts.push(prompt);
+          return {
+            id: `run-${prompts.length}`,
+            async *stream() {
+              yield { type: "assistant", message: { content: [{ type: "text", text: "ok" }] } };
+            },
+            async wait() {
+              return { status: "finished", result: "ok" };
+            },
+            async cancel() {}
+          };
+        }
+      };
+    });
+    const base = {
+      apiKey: "test-key",
+      model: "composer-2.5",
+      sessionKey: "reuse-session",
+      workingDirectory: "/tmp/project",
+      clientTools: []
+    };
+    await runLocalAgent({ ...base, prompt: "full transcript turn 1", requestId: "req-1" });
+    await runLocalAgent({
+      ...base,
+      prompt: "full transcript turn 1\nand turn 2",
+      incrementalPrompt: "Continue from this new input only:\n\nand turn 2",
+      requestId: "req-2"
+    });
+    expect(creates).toBe(1);
+    expect(prompts).toEqual([
+      "full transcript turn 1",
+      "Continue from this new input only:\n\nand turn 2"
+    ]);
+    _resetBridgeStateForTests();
+  });
+
+  it("creates a fresh agent when the same session is replayed without incrementalPrompt", async () => {
+    _resetBridgeStateForTests();
+    let creates = 0;
+    _setCreateAgentForTests(async () => {
+      creates += 1;
+      return {
+        agentId: `agent-${creates}`,
+        close() {},
+        async send() {
+          return {
+            id: `run-${creates}`,
+            async *stream() {
+              yield { type: "assistant", message: { content: [{ type: "text", text: "ok" }] } };
+            },
+            async wait() {
+              return { status: "finished", result: "ok" };
+            },
+            async cancel() {}
+          };
+        }
+      };
+    });
+    const base = {
+      apiKey: "test-key",
+      model: "composer-2.5",
+      prompt: "full transcript",
+      sessionKey: "replay-session",
+      workingDirectory: "/tmp/project",
+      requestId: "req-1",
+      clientTools: []
+    };
+    await runLocalAgent(base);
+    await runLocalAgent({ ...base, requestId: "req-2" });
+    expect(creates).toBe(2);
+    _resetBridgeStateForTests();
+  });
+
   it("does not treat Cursor builtins as client-forwardable MCP parks", () => {
     expect(isCursorBuiltinToolName("shell")).toBe(true);
     expect(isCursorBuiltinToolName("write")).toBe(true);
@@ -1994,6 +2077,25 @@ describe("Cursor SDK local-agent bridge", () => {
     expect(baseSendOptions.mcpServers.client.env.CURSOR_SDK_BRIDGE_CLIENT_TOOLS_JSON).toContain("webfetch");
     expect(dynamicSendOptions.mcpServers.client.env.CURSOR_SDK_BRIDGE_CLIENT_TOOLS_JSON).toContain("webfetch");
     expect(dynamicSendOptions.mcpServers.client.env.CURSOR_SDK_BRIDGE_CLIENT_TOOLS_JSON).toContain("probe_write_file");
+  });
+
+  it("keeps MCP stdio env identical on create and later sends", () => {
+    const input = {
+      apiKey: "test-key",
+      model: "composer-2.5",
+      workingDirectory: "/tmp/project",
+      sessionKey: "shared-session",
+      mcpToken: "stable-mcp-token",
+      clientTools: [{ name: "webfetch", parameters: { type: "object", properties: { url: { type: "string" } } } }]
+    };
+
+    const createOptions = localAgentCreateOptions(input);
+    const sendOptions = localAgentSendOptions(input);
+    const laterSend = localAgentSendOptions({ ...input, runToken: "per-run-should-not-leak" });
+
+    expect(createOptions.mcpServers.client.env.CURSOR_SDK_BRIDGE_RUN_TOKEN).toBe("stable-mcp-token");
+    expect(sendOptions.mcpServers.client.env).toEqual(createOptions.mcpServers.client.env);
+    expect(laterSend.mcpServers.client.env).toEqual(createOptions.mcpServers.client.env);
   });
 
   it("parks sibling MCP calls independently and resumes the same Cursor run", async () => {

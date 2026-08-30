@@ -42,11 +42,8 @@ export async function* runSdkStream(
 ): AsyncGenerator<CursorTextEvent> {
   let attemptInput = input;
   for (let attempt = 1; attempt <= TOOL_RETRY_ATTEMPTS; attempt += 1) {
-    // Hold output only when a workspace mutation is required and we can still
-    // retry a prose-only answer. Buffering every tool-bearing run (Rho's
-    // default) left Responses SSE idle after response.created until the whole
-    // Cursor turn finished, then closed empty if the bridge threw.
-    const holdForRetry = input.requiresLocalTool && attempt < TOOL_RETRY_ATTEMPTS;
+    // Stream immediately. Holding prose until a tool_call delayed TTFT on
+    // mutation turns; retries still run only when nothing was forwarded.
     const buffered: CursorTextEvent[] = [];
     let sawToolCall = false;
     let sawText = false;
@@ -60,11 +57,6 @@ export async function* runSdkStream(
       if (event.type === "rejected_tool_call") {
         rejectedToolCall = event.toolCall;
         rejectedReason = event.reason;
-        buffered.push(event);
-        continue;
-      }
-
-      if (holdForRetry && !sawToolCall) {
         buffered.push(event);
         continue;
       }

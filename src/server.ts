@@ -16,6 +16,7 @@ import {
   responseTextStartEvents,
   responseToolCallEvents,
   toOpenAiToolCalls,
+  incrementalContinuationPrompt,
   type OpenAiToolSpec,
   type PreparedRequest,
   type ToolCallContext
@@ -47,8 +48,16 @@ interface StoredResponseState {
   response?: Record<string, unknown>;
   inputItems: unknown[];
   outputItems: unknown[];
+  inputFingerprints: string[];
+  fullFingerprints: string[];
+  functionCallFingerprints: string[];
   sdkSessionKey?: string;
   updatedAt: number;
+}
+
+interface SessionPrefixMatch {
+  sessionKey: string;
+  newInputItems: unknown[];
 }
 
 export interface ServerContext {
@@ -204,51 +213,61 @@ async function handlePrepared(
   state?: { ownerKey?: string; previousState?: StoredResponseState }
 ): Promise<Response> {
   const created = Math.floor(ctx.now().getTime() / 1000);
+  const affinity = sessionAffinity(request);
+  const prefixMatch =
+    kind === "responses" && state?.ownerKey && !state.previousState?.sdkSessionKey && !affinity
+      ? matchSessionByTranscriptPrefix(state.ownerKey, prepared)
+      : undefined;
   const sdkSessionKey =
     state?.previousState?.sdkSessionKey
-    || sessionAffinity(request)
-    || matchSessionByTranscriptPrefix(state?.ownerKey, prepared)
+    || affinity
+    || prefixMatch?.sessionKey
     || conversationSeed(prepared)
     || id;
+  const knownSession = seenSessionKeys.has(sdkSessionKey)
+    || Boolean(state?.previousState?.sdkSessionKey)
+    || Boolean(prefixMatch);
+  rememberSessionKey(sdkSessionKey);
+  const ready = attachIncrementalPrompt(prepared, knownSession, prefixMatch);
 
-  if (prepared.stream) {
-    return streamPrepared(kind, prepared, request, ctx, apiKey, id, created, sdkSessionKey, state?.ownerKey);
+  if (ready.stream) {
+    return streamPrepared(kind, ready, request, ctx, apiKey, id, created, sdkSessionKey, state?.ownerKey);
   }
 
-  const output = await completePrepared(prepared, request, ctx, apiKey, sdkSessionKey);
+  const output = await completePrepared(ready, request, ctx, apiKey, sdkSessionKey);
   const toolCalls = toOpenAiToolCalls({
     toolCalls: output.toolCalls,
-    tools: prepared.tools,
+    tools: ready.tools,
     responseId: id,
-    context: prepared.toolContext
+    context: ready.toolContext
   });
   if (kind === "chat") {
     return json(
       chatCompletionResponse({
         id,
         created,
-        model: prepared.model,
+        model: ready.model,
         text: output.text,
         toolCalls,
-        promptChars: prepared.promptChars,
-        metadata: prepared.responseMetadata
+        promptChars: ready.promptChars,
+        metadata: ready.responseMetadata
       })
     );
   }
   const response = responseObject({
     id,
     created,
-    model: prepared.model,
+    model: ready.model,
     text: output.text,
     toolCalls,
-    promptChars: prepared.promptChars,
-    metadata: prepared.responseMetadata
+    promptChars: ready.promptChars,
+    metadata: ready.responseMetadata
   });
   if (state?.ownerKey) {
     storeResponseState(state.ownerKey, {
       id,
       response,
-      inputItems: prepared.responseInputItems ?? [],
+      inputItems: ready.responseInputItems ?? [],
       outputItems: (response.output as unknown[]) ?? [],
       store: prepared.storeResponse !== false,
       sdkSessionKey,
@@ -611,36 +630,66 @@ function sessionAffinity(request: Request): string | undefined {
   )?.trim() || undefined;
 }
 
-function matchSessionByTranscriptPrefix(ownerKey: string | undefined, prepared: PreparedRequest): string | undefined {
+function matchSessionByTranscriptPrefix(ownerKey: string | undefined, prepared: PreparedRequest): SessionPrefixMatch | undefined {
   if (!ownerKey) return undefined;
-  const current = canonicalResponseItems(prepared.responseInputItems ?? []);
+  const currentItems = prepared.responseInputItems ?? [];
+  const current = fingerprintsForItems(currentItems);
   if (!current.length) return undefined;
-  let best: { sessionKey: string; updatedAt: number } | undefined;
+  let best: { sessionKey: string; updatedAt: number; newInputItems: unknown[] } | undefined;
   for (const stored of responseState.values()) {
     if (stored.ownerKey !== ownerKey || !stored.sdkSessionKey) continue;
-    const inputPrefix = canonicalResponseItems(stored.inputItems ?? []);
-    const fullPrefix = canonicalResponseItems([...(stored.inputItems ?? []), ...(stored.outputItems ?? [])]);
-    const outputCalls = canonicalResponseItems(stored.outputItems ?? []).filter((item) => isRecord(item) && item.type === "function_call");
-    const exactPrefix = fullPrefix.length > 0 && responseItemsArePrefix(fullPrefix, current);
+    const inputPrefix = stored.inputFingerprints;
+    const fullPrefix = stored.fullFingerprints;
+    const outputCalls = stored.functionCallFingerprints;
+    const exactPrefix = fullPrefix.length > 0 && fingerprintPrefix(fullPrefix, current);
     // Rho resends input items plus function_call_output, not assistant message
     // output items. Require the stored input prefix and every stored function_call.
     const inputAndCalls = inputPrefix.length > 0
-      && responseItemsArePrefix(inputPrefix, current)
-      && outputCalls.every((call) => current.some((item) => JSON.stringify(item) === JSON.stringify(call)));
+      && fingerprintPrefix(inputPrefix, current)
+      && outputCalls.every((call) => current.includes(call));
     if (!exactPrefix && !inputAndCalls) continue;
+    const newInputItems = exactPrefix
+      ? currentItems.slice(fullPrefix.length)
+      : leftoverAfterInputAndCalls(currentItems, inputPrefix.length, outputCalls);
     if (!best || stored.updatedAt > best.updatedAt) {
-      best = { sessionKey: stored.sdkSessionKey, updatedAt: stored.updatedAt };
+      best = { sessionKey: stored.sdkSessionKey, updatedAt: stored.updatedAt, newInputItems };
     }
   }
-  return best?.sessionKey;
+  return best ? { sessionKey: best.sessionKey, newInputItems: best.newInputItems } : undefined;
 }
 
-function responseItemsArePrefix(prefix: unknown[], current: unknown[]): boolean {
+function leftoverAfterInputAndCalls(currentItems: unknown[], inputPrefixLength: number, outputCallFingerprints: string[]): unknown[] {
+  return currentItems.slice(inputPrefixLength).filter((item) => {
+    const fingerprint = JSON.stringify(canonicalResponseItem(item));
+    return !outputCallFingerprints.includes(fingerprint);
+  });
+}
+
+function fingerprintPrefix(prefix: string[], current: string[]): boolean {
   if (current.length < prefix.length) return false;
   for (let index = 0; index < prefix.length; index += 1) {
-    if (JSON.stringify(prefix[index]) !== JSON.stringify(current[index])) return false;
+    if (prefix[index] !== current[index]) return false;
   }
   return true;
+}
+
+function fingerprintsForItems(items: unknown[]): string[] {
+  return canonicalResponseItems(items).map((item) => JSON.stringify(item));
+}
+
+function attachIncrementalPrompt(
+  prepared: PreparedRequest,
+  knownSession: boolean,
+  prefixMatch?: SessionPrefixMatch
+): PreparedRequest {
+  if (prepared.incrementalPrompt || !knownSession) return prepared;
+  const continuationInput = prefixMatch?.newInputItems?.length
+    ? prefixMatch.newInputItems
+    : prepared.responseInputItems;
+  if (!continuationInput?.length) return prepared;
+  const incremental = incrementalContinuationPrompt(continuationInput, prepared.tools);
+  if (!incremental || incremental === prepared.prompt.text) return prepared;
+  return { ...prepared, incrementalPrompt: incremental };
 }
 
 function canonicalResponseItems(items: unknown[]): unknown[] {
@@ -692,9 +741,32 @@ function boundedTranscriptItems(items: unknown[]): unknown[] {
   return [];
 }
 
+const AGENT_MODE_SWITCH_USER = "Please switch to agent mode.";
+const SEEN_SESSION_LIMIT = 2048;
+const seenSessionKeys = new Set<string>();
+
+function rememberSessionKey(sessionKey: string) {
+  if (seenSessionKeys.has(sessionKey)) {
+    seenSessionKeys.delete(sessionKey);
+    seenSessionKeys.add(sessionKey);
+    return;
+  }
+  seenSessionKeys.add(sessionKey);
+  if (seenSessionKeys.size <= SEEN_SESSION_LIMIT) return;
+  const oldest = seenSessionKeys.values().next().value;
+  if (oldest) seenSessionKeys.delete(oldest);
+}
+
 function conversationSeed(prepared: PreparedRequest): string | undefined {
   const text = prepared.prompt.text;
-  const user = /\nUSER: (.+)/.exec(text)?.[1]?.trim();
+  let user: string | undefined;
+  for (const match of text.matchAll(/\nUSER: (.+)/g)) {
+    const line = match[1]?.trim();
+    if (line && line !== AGENT_MODE_SWITCH_USER) {
+      user = line;
+      break;
+    }
+  }
   const inputIdx = text.indexOf("\nINPUT:\n");
   const inputFirst = inputIdx >= 0 ? text.slice(inputIdx + "\nINPUT:\n".length).split("\n")[0]?.trim() : undefined;
   const seed = user || inputFirst;
@@ -730,12 +802,20 @@ function storeResponseState(
     now: number;
   }
 ) {
+  const storedInputItems = input.store ? boundedTranscriptItems(input.inputItems) : [];
+  const storedOutputItems = boundedTranscriptItems(input.outputItems);
+  const canonicalOutput = canonicalResponseItems(storedOutputItems);
   responseState.set(responseStateKey(ownerKey, input.id), {
     ownerKey,
     id: input.id,
     response: input.store ? input.response : undefined,
-    inputItems: input.store ? boundedTranscriptItems(input.inputItems) : [],
-    outputItems: boundedTranscriptItems(input.outputItems),
+    inputItems: storedInputItems,
+    outputItems: storedOutputItems,
+    inputFingerprints: fingerprintsForItems(storedInputItems),
+    fullFingerprints: fingerprintsForItems([...storedInputItems, ...storedOutputItems]),
+    functionCallFingerprints: canonicalOutput
+      .filter((item) => isRecord(item) && item.type === "function_call")
+      .map((item) => JSON.stringify(item)),
     sdkSessionKey: input.sdkSessionKey,
     updatedAt: input.now
   });
@@ -769,4 +849,5 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 export function _resetResponseStateForTests(): void {
   responseState.clear();
+  seenSessionKeys.clear();
 }
