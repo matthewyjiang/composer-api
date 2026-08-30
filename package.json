@@ -19,7 +19,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc && cp src/bridge.mjs dist/bridge.mjs",
+    "build": "tsc && cp src/bridge*.mjs dist/",
     "start": "node dist/cli.js serve",
     "dev": "node --experimental-strip-types src/cli.ts serve",
     "test": "vitest run",

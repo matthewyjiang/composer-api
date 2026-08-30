@@ -19,8 +19,18 @@ export interface CursorToolCall {
   id?: string;
 }
 
+/** Cursor SDK TokenUsage from a turn stream or run.wait(). */
+export interface CursorTokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  reasoningTokens?: number;
+}
+
 export type CursorTextEvent =
   | { type: "text"; text: string }
   | { type: "tool_call"; toolCall: CursorToolCall }
   | { type: "rejected_tool_call"; toolCall: CursorToolCall; reason?: string }
-  | { type: "done"; finalText: string; toolCalls: CursorToolCall[] };
+  | { type: "done"; finalText: string; toolCalls: CursorToolCall[]; usage?: CursorTokenUsage };

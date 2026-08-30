@@ -1,6 +1,6 @@
 import type { OpenAiToolSpec } from "./openai.js";
-import { toolCallRetryHint, toOpenAiToolCalls } from "./openai.js";
-import type { CursorTextEvent, CursorToolCall } from "./types.js";
+import { parseCursorTokenUsage, toolCallRetryHint, toOpenAiToolCalls } from "./openai.js";
+import type { CursorTextEvent, CursorTokenUsage, CursorToolCall } from "./types.js";
 
 const TOOL_RETRY_ATTEMPTS = 3;
 
@@ -34,6 +34,7 @@ export interface SdkRunOutput {
   toolCalls: CursorToolCall[];
   agentID: string;
   runID: string;
+  usage?: CursorTokenUsage;
 }
 
 export async function* runSdkStream(
@@ -104,15 +105,17 @@ export async function collectSdkOutput(stream: AsyncIterable<CursorTextEvent>): 
   const toolCalls: CursorToolCall[] = [];
   let agentID = "";
   let runID = "";
+  let usage: CursorTokenUsage | undefined;
   for await (const event of stream) {
     if (event.type === "text") text += event.text;
     if (event.type === "tool_call") toolCalls.push(event.toolCall);
     if (event.type === "done") {
       text = event.finalText || text;
       if (event.toolCalls.length && !toolCalls.length) toolCalls.push(...event.toolCalls);
+      usage = event.usage ?? usage;
     }
   }
-  return { text, toolCalls, agentID, runID };
+  return { text, toolCalls, agentID, runID, ...(usage ? { usage } : {}) };
 }
 
 async function* runSdkBridgeOnce(
@@ -195,7 +198,8 @@ async function* runSdkBridgeOnce(
       } else if (!text && outputText) {
         yield { type: "text", text: outputText };
       }
-      yield { type: "done", finalText: outputText, toolCalls: outputToolCalls };
+      const usage = parseCursorTokenUsage(output.usage);
+      yield { type: "done", finalText: outputText, toolCalls: outputToolCalls, ...(usage ? { usage } : {}) };
       return;
     }
   }

@@ -3,6 +3,8 @@ import {
   prepareChatRequest,
   prepareOpencodeSdkChatRequest,
   prepareResponsesRequest,
+  cachedCharsFromIncremental,
+  parseCursorTokenUsage,
   chatCompletionResponse,
   chatUsageChunk,
   responseObject,
@@ -1876,6 +1878,111 @@ describe("OpenAI compatibility adapter", () => {
     expect(chunk).toContain('"usage"');
     expect(chunk).toContain('"total_tokens"');
     expect(chunk).toContain('"total_usd"');
+  });
+
+  it("prices continuation prefixes as cache reads, not full input",
+    () => {
+      expect(cachedCharsFromIncremental(4000, "x".repeat(800))).toBe(3200);
+      expect(cachedCharsFromIncremental(4000)).toBe(0);
+      expect(cachedCharsFromIncremental(4000, "x".repeat(4000))).toBe(0);
+
+      const miss = chatCompletionResponse({
+        id: "chatcmpl_miss",
+        created: 1,
+        model: "composer-2.5",
+        text: "x".repeat(400),
+        promptChars: 4000
+      });
+      const hit = chatCompletionResponse({
+        id: "chatcmpl_hit",
+        created: 1,
+        model: "composer-2.5",
+        text: "x".repeat(400),
+        promptChars: 4000,
+        cachedChars: 3200
+      });
+
+      expect(miss.usage).toMatchObject({
+        prompt_tokens: 1000,
+        prompt_tokens_details: { cached_tokens: 0 },
+        cost: {
+          input_usd: 0.0005,
+          cache_read_usd: 0,
+          output_usd: 0.00025,
+          total_usd: 0.00075,
+          pricing: {
+            input_per_million_tokens_usd: 0.5,
+            cache_read_per_million_tokens_usd: 0.2,
+            output_per_million_tokens_usd: 2.5
+          }
+        }
+      });
+      expect(hit.usage).toMatchObject({
+        prompt_tokens: 1000,
+        prompt_tokens_details: { cached_tokens: 800 },
+        cost: {
+          input_usd: 0.00026,
+          cache_read_usd: 0.00016,
+          output_usd: 0.00025,
+          total_usd: 0.00051
+        }
+      });
+    }
+  );
+
+  it("prefers Cursor SDK token counts over character estimates", () => {
+    expect(parseCursorTokenUsage({ inputTokens: 12, outputTokens: 3 })).toEqual({
+      inputTokens: 12,
+      outputTokens: 3,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      totalTokens: 15
+    });
+
+    const exclusive = chatCompletionResponse({
+      id: "chatcmpl_sdk",
+      created: 1,
+      model: "composer-2.5",
+      text: "x".repeat(400),
+      promptChars: 4000,
+      reportedUsage: {
+        inputTokens: 200,
+        outputTokens: 10,
+        cacheReadTokens: 800,
+        cacheWriteTokens: 0,
+        totalTokens: 1010
+      }
+    });
+    expect(exclusive.usage).toMatchObject({
+      prompt_tokens: 1000,
+      completion_tokens: 10,
+      prompt_tokens_details: { cached_tokens: 800 },
+      cost: {
+        input_usd: 0.00026,
+        cache_read_usd: 0.00016,
+        output_usd: 0.000025,
+        total_usd: 0.000285
+      }
+    });
+
+    const inclusive = chatCompletionResponse({
+      id: "chatcmpl_inc",
+      created: 1,
+      model: "composer-2.5",
+      text: "ok",
+      promptChars: 20,
+      reportedUsage: {
+        inputTokens: 1000,
+        outputTokens: 10,
+        cacheReadTokens: 800,
+        cacheWriteTokens: 0,
+        totalTokens: 1010
+      }
+    });
+    expect(inclusive.usage).toMatchObject({
+      prompt_tokens: 1000,
+      prompt_tokens_details: { cached_tokens: 800 }
+    });
   });
 
   it("numbers function_call output ids by output index so streamed and completed items match", () => {

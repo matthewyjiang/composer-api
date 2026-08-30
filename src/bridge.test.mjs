@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import http from "node:http";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import {
   bridgePrompt,
-  clientForwardingMcpServerSource,
   clientMcpToolDefinitions,
+  runClientForwardingMcpServer,
   localAgentCreateOptions,
   localAgentSendOptions,
   isForwardableSDKToolCall,
@@ -20,6 +21,7 @@ import {
   toolCallFromDelta,
   validateClientMcpToolCall,
   hasDistinctIncrementalPrompt,
+  normalizeTokenUsage,
   ingestClientToolCall,
   isCursorBuiltinToolName,
   _resetBridgeStateForTests,
@@ -80,6 +82,52 @@ describe("Cursor SDK local-agent bridge", () => {
       "full transcript turn 1",
       "Continue from this new input only:\n\nand turn 2"
     ]);
+    _resetBridgeStateForTests();
+  });
+
+  it("forwards Cursor stream and wait usage on the done output", async () => {
+    _resetBridgeStateForTests();
+    const usage = {
+      inputTokens: 12,
+      outputTokens: 3,
+      cacheReadTokens: 40,
+      cacheWriteTokens: 0,
+      totalTokens: 55
+    };
+    _setCreateAgentForTests(async () => ({
+      agentId: "agent-usage",
+      close() {},
+      async send() {
+        return {
+          id: "run-usage",
+          async *stream() {
+            yield { type: "assistant", message: { content: [{ type: "text", text: "ok" }] } };
+            yield { type: "usage", usage };
+          },
+          async wait() {
+            return { status: "finished", result: "ok", usage };
+          },
+          async cancel() {}
+        };
+      }
+    }));
+    const output = await runLocalAgent({
+      apiKey: "test-key",
+      model: "composer-2.5",
+      prompt: "hello",
+      sessionKey: "usage-session",
+      workingDirectory: "/tmp/project",
+      requestId: "req-usage",
+      clientTools: []
+    });
+    expect(output.usage).toEqual(usage);
+    expect(normalizeTokenUsage({ inputTokens: 1, outputTokens: 2 })).toEqual({
+      inputTokens: 1,
+      outputTokens: 2,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      totalTokens: 3
+    });
     _resetBridgeStateForTests();
   });
 
@@ -1615,125 +1663,102 @@ describe("Cursor SDK local-agent bridge", () => {
     })).toBe(null);
   });
 
-  it("bundles nested schema validation into the generated MCP forwarding server", () => {
-    const source = clientForwardingMcpServerSource([
-      {
-        name: "call_mcp_tool",
-        parameters: {
-          type: "object",
-          properties: {
-            serverName: { type: "string" },
-            input: {
-              type: "object",
-              properties: {
-                mode: { type: "string", enum: ["create"] }
-              },
-              required: ["mode"]
-            }
-          },
-          required: ["serverName", "input"]
+  it("validates nested schemas in the MCP forwarding child", async () => {
+    const stdout = await runMcpChildOnce({
+      tools: clientMcpToolDefinitions([
+        {
+          name: "call_mcp_tool",
+          parameters: {
+            type: "object",
+            properties: {
+              serverName: { type: "string" },
+              input: {
+                type: "object",
+                properties: {
+                  mode: { type: "string", enum: ["create"] }
+                },
+                required: ["mode"]
+              }
+            },
+            required: ["serverName", "input"]
+          }
         }
-      }
-    ]);
-    const message = {
-      jsonrpc: "2.0",
-      id: 1,
-      method: "tools/call",
-      params: {
-        name: "call_mcp_tool",
-        arguments: {
-          serverName: "filesystem",
-          input: { mode: "append" }
-        }
-      }
-    };
-
-    const result = spawnSync(process.execPath, ["-e", source], {
-      input: `${JSON.stringify(message)}\n`,
-      encoding: "utf8",
-      timeout: 1000
-    });
-
-    expect(result.status).toBe(0);
-    expect(result.stderr).toBe("");
-    const response = JSON.parse(result.stdout.trim());
-    expect(response.error.message).toContain("expected one of");
-  });
-
-  it("bundles referenced schema validation into the generated MCP forwarding server", () => {
-    const source = clientForwardingMcpServerSource([
-      {
-        name: "ref_write_file",
-        parameters: {
-          type: "object",
-          properties: {
-            target: { $ref: "#/$defs/fileTarget" }
-          },
-          required: ["target"],
-          $defs: {
-            fileTarget: {
-              type: "object",
-              properties: {
-                mode: { type: "string", enum: ["create"] }
-              },
-              required: ["mode"]
-            }
+      ]),
+      message: {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "call_mcp_tool",
+          arguments: {
+            serverName: "filesystem",
+            input: { mode: "append" }
           }
         }
       }
-    ]);
-    const message = {
-      jsonrpc: "2.0",
-      id: 1,
-      method: "tools/call",
-      params: {
-        name: "ref_write_file",
-        arguments: {
-          target: { mode: "append" }
-        }
-      }
-    };
-
-    const result = spawnSync(process.execPath, ["-e", source], {
-      input: `${JSON.stringify(message)}\n`,
-      encoding: "utf8",
-      timeout: 1000
     });
-
-    expect(result.status).toBe(0);
-    expect(result.stderr).toBe("");
-    const response = JSON.parse(result.stdout.trim());
+    const response = JSON.parse(stdout.trim());
     expect(response.error.message).toContain("expected one of");
   });
 
-  it("does not fake a forwarded MCP result when the bridge callback is unavailable", () => {
-    const source = clientForwardingMcpServerSource([]);
-    const message = {
-      jsonrpc: "2.0",
-      id: 1,
-      method: "tools/call",
-      params: {
-        name: "client_shell",
-        arguments: {
-          command: "printf SHOULD_NOT_RUN"
+  it("validates referenced schemas in the MCP forwarding child", async () => {
+    const stdout = await runMcpChildOnce({
+      tools: clientMcpToolDefinitions([
+        {
+          name: "ref_write_file",
+          parameters: {
+            type: "object",
+            properties: {
+              target: { $ref: "#/$defs/fileTarget" }
+            },
+            required: ["target"],
+            $defs: {
+              fileTarget: {
+                type: "object",
+                properties: {
+                  mode: { type: "string", enum: ["create"] }
+                },
+                required: ["mode"]
+              }
+            }
+          }
+        }
+      ]),
+      message: {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "ref_write_file",
+          arguments: {
+            target: { mode: "append" }
+          }
         }
       }
-    };
+    });
+    const response = JSON.parse(stdout.trim());
+    expect(response.error.message).toContain("expected one of");
+  });
 
-    const result = spawnSync(process.execPath, ["-e", source], {
-      input: `${JSON.stringify(message)}\n`,
-      encoding: "utf8",
-      timeout: 3000,
-      env: {
-        ...process.env,
-        CURSOR_SDK_BRIDGE_CALLBACK_URL: "http://127.0.0.1:1/client-tool-call",
-        CURSOR_SDK_BRIDGE_AGENT_CACHE_KEY: "cache-key"
+  it("does not fake a forwarded MCP result when the bridge callback is unavailable", async () => {
+    const stdout = await runMcpChildOnce({
+      tools: clientMcpToolDefinitions([]),
+      callbackUrl: "http://127.0.0.1:1/client-tool-call",
+      callbackCacheKey: "cache-key",
+      parkedCallTimeoutMs: 1000,
+      message: {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "client_shell",
+          arguments: {
+            command: "printf SHOULD_NOT_RUN"
+          }
+        }
       }
     });
-
-    expect(result.status).toBe(0);
-    expect(result.stderr).toBe("");
-    const response = JSON.parse(result.stdout.trim());
+    const response = JSON.parse(stdout.trim());
     expect(response.error.message).toContain("Outer client callback unavailable");
   });
 
@@ -2263,6 +2288,33 @@ describe("Cursor SDK local-agent bridge", () => {
     _resetBridgeStateForTests();
   });
 });
+
+async function runMcpChildOnce({
+  tools,
+  message,
+  callbackUrl = "",
+  callbackCacheKey = "",
+  parkedCallTimeoutMs = 1000
+}) {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const chunks = [];
+  output.on("data", (chunk) => chunks.push(chunk));
+  const running = runClientForwardingMcpServer({
+    tools,
+    callbackUrl,
+    callbackToken: "",
+    callbackCacheKey,
+    callbackRunToken: "",
+    parkedCallTimeoutMs,
+    input,
+    output,
+    validateClientMcpToolCall
+  });
+  input.end(`${JSON.stringify(message)}\n`);
+  await running;
+  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
+}
 
 function parkedHttp() {
   let resolveBody;

@@ -5,6 +5,8 @@ import http from "node:http";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
+import { createPendingRunRuntime } from "./bridge-pending-run.mjs";
+import { parseClientMcpToolsJSON, runClientForwardingMcpServer } from "./bridge-mcp-child.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -42,11 +44,19 @@ const clientToolCallbackPath = "/client-tool-call";
 
 const agentCache = new Map();
 const agentRunQueues = new Map();
-const pendingRunsBySession = new Map();
-const pendingRunsByToken = new Map();
-const parkedMcpCalls = new Map();
 let createAgentImpl = defaultCreateAgent;
-let parkedCallTimeoutMsOverride;
+const pendingRuntime = createPendingRunRuntime({
+  maxPendingRuns,
+  parkedCallTimeoutMs,
+  toolFlushGraceMs,
+  writeJson,
+  normalizeSDKToolCall,
+  evictAgent,
+  stripFinalMarker,
+  sdkRunFailureError,
+  isRecord,
+  normalizeTokenUsage
+});
 let server = null;
 
 if (isMainModule()) {
@@ -63,7 +73,7 @@ if (isMainModule()) {
 export {
   bridgePrompt,
   clientMcpToolDefinitions,
-  clientForwardingMcpServerSource,
+  runClientForwardingMcpServer,
   localAgentCreateOptions,
   localAgentSendOptions,
   isForwardableSDKToolCall,
@@ -80,6 +90,7 @@ export {
   validateClientMcpToolCall,
   toolCallFromDelta,
   hasDistinctIncrementalPrompt,
+  normalizeTokenUsage,
   runLocalAgent,
   ingestClientToolCall,
   resolveParkedMcpCall,
@@ -180,7 +191,7 @@ async function handleClientToolCallback(request, response) {
   }
 
   const body = await readJsonBody(request);
-  const parked = ingestClientToolCall(body, response);
+  const parked = pendingRuntime.ingestClientToolCall(body, response);
   if (!parked.accepted) {
     writeJson(response, { ok: true, accepted: false, callId: parked.callId });
   }
@@ -287,21 +298,11 @@ async function runExclusiveForAgent(input, work) {
 }
 
 async function runLocalAgentBody(input, onRun, onEvent) {
-  const existing = pendingRunsBySession.get(input.sessionKey);
-  if (existing && !existing.evicted) {
-    const results = Array.isArray(input.toolResults) ? input.toolResults : [];
-    const matched = results.filter((result) => parkedMcpCalls.has(result.call_id) && parkedMcpCalls.get(result.call_id)?.runToken === existing.runToken);
-    if (matched.length && !existing.streamEnded && !existing.streamError) {
-      onRun(existing.run);
-      return resumePendingRun(existing, matched, onEvent);
-    }
-    // No live parked MCP reply for these results (Cursor may have already
-    // timed the tools/call out). Fail remaining parks and start a fresh run
-    // with the tool result already in the prompt.
-    evictPendingRun(existing, "unmatched_or_stale_pending_run");
-    if (existing.agentEntry) evictAgent(existing.agentEntry.cacheKey, existing.agentEntry.agent);
-  }
-  return startFreshLocalAgentRun(input, onRun, onEvent);
+  return pendingRuntime.attachOrStart(input, {
+    onRun,
+    onEvent,
+    startFresh: startFreshLocalAgentRun
+  });
 }
 
 async function startFreshLocalAgentRun(input, onRun, onEvent) {
@@ -315,295 +316,28 @@ async function startFreshLocalAgentRun(input, onRun, onEvent) {
     agentEntry = await getAgent(input);
   }
   const prompt = reuseCache ? input.incrementalPrompt : input.prompt;
-  const pending = createPendingRun(input, agentEntry, runToken);
+  const pending = pendingRuntime.beginPendingRun(input, agentEntry, runToken);
   const sendInput = { ...input, runToken, mcpToken: agentEntry.mcpToken };
   try {
     const run = await agentEntry.agent.send(prompt, {
       ...localAgentSendOptions(sendInput),
       idempotencyKey: input.requestId
     });
-    pending.run = run;
+    pendingRuntime.bindRun(pending, run);
     onRun(run);
-    startStreamConsumer(pending);
   } catch (error) {
-    forgetPendingRun(pending);
+    pendingRuntime.forgetPendingRun(pending);
     throw error;
   }
-  return attachConsumerAndWait(pending, onEvent);
-}
-
-async function resumePendingRun(pending, results, onEvent) {
-  for (const result of results) {
-    resolveParkedMcpCall(result.call_id, result.output);
-  }
-  return attachConsumerAndWait(pending, onEvent);
-}
-
-function createPendingRun(input, agentEntry, runToken) {
-  while (pendingRunsBySession.size >= maxPendingRuns) {
-    const oldest = [...pendingRunsBySession.values()].sort((left, right) => left.createdAt - right.createdAt)[0];
-    if (!oldest) break;
-    evictPendingRun(oldest, "pending_run_capacity");
-  }
-  const pending = {
-    sessionKey: input.sessionKey,
-    runToken,
-    cacheKey: agentEntry.cacheKey,
-    input,
-    agentEntry,
-    run: null,
-    parkedCallIds: new Set(),
-    turnParked: [],
-    buffered: [],
-    text: "",
-    streamEnded: false,
-    streamError: null,
-    evicted: false,
-    createdAt: Date.now(),
-    consumer: null,
-    mcpToken: agentEntry.mcpToken,
-    notifyParked: null,
-    consumeLoop: null
-  };
-  pendingRunsBySession.set(input.sessionKey, pending);
-  pendingRunsByToken.set(runToken, pending);
-  if (agentEntry.mcpToken) pendingRunsByToken.set(agentEntry.mcpToken, pending);
-  return pending;
-}
-
-function startStreamConsumer(pending) {
-  pending.consumeLoop = (async () => {
-    try {
-      for await (const event of pending.run.stream()) {
-        if (pending.evicted) return;
-        handlePendingStreamEvent(pending, event);
-      }
-      pending.streamEnded = true;
-    } catch (error) {
-      if (!pending.evicted) pending.streamError = error;
-    } finally {
-      pending.notifyParked?.();
-    }
-  })();
-}
-
-function handlePendingStreamEvent(pending, event) {
-  if (event.type !== "assistant") return;
-  for (const block of event.message?.content ?? []) {
-    if (block?.type !== "text" || typeof block.text !== "string" || !block.text) continue;
-    const textEvent = { type: "text", text: block.text };
-    if (pending.consumer?.emit) {
-      pending.text += block.text;
-      pending.consumer.emit(textEvent);
-    } else {
-      pending.buffered.push(textEvent);
-    }
-  }
-}
-
-async function attachConsumerAndWait(pending, onEvent) {
-  pending.turnParked = [];
-  pending.consumer = { emit: onEvent };
-  for (const event of pending.buffered) {
-    if (event.type === "text") {
-      pending.text += event.text;
-      onEvent?.(event);
-    } else if (event.type === "tool_call") {
-      pending.turnParked.push(event.toolCall);
-      onEvent?.(event);
-    }
-  }
-  pending.buffered = [];
-  await waitForTurnEnd(pending);
-  pending.consumer = null;
-
-  if (pending.turnParked.length) {
-    return {
-      text: "",
-      toolCalls: pending.turnParked,
-      agentID: pending.agentEntry?.agent.agentId || "",
-      runID: pending.run?.id || pending.input.requestId,
-      status: "tool_call"
-    };
-  }
-
-  if (pending.streamError) {
-    const error = pending.streamError;
-    evictPendingRun(pending, "stream_error");
-    throw error;
-  }
-
-  const result = await pending.run.wait();
-  const text = pending.text;
-  const agentEntry = pending.agentEntry;
-  const runId = pending.run?.id;
-  forgetPendingRun(pending);
-  if (result.status === "error") {
-    if (agentEntry) evictAgent(agentEntry.cacheKey, agentEntry.agent);
-    throw sdkRunFailureError(result);
-  }
-  const finalText = !text && typeof result.result === "string" ? result.result : text;
-  return {
-    text: stripFinalMarker(finalText),
-    toolCalls: [],
-    agentID: agentEntry?.agent.agentId || "",
-    runID: runId,
-    status: result.status
-  };
-}
-
-function waitForTurnEnd(pending) {
-  return new Promise((resolve) => {
-    let flushTimer = null;
-    let settled = false;
-    const done = () => {
-      if (settled) return;
-      settled = true;
-      pending.notifyParked = null;
-      if (flushTimer) clearTimeout(flushTimer);
-      resolve();
-    };
-    pending.notifyParked = () => {
-      if (pending.evicted || pending.streamError) {
-        done();
-        return;
-      }
-      if (pending.streamEnded && pending.turnParked.length === 0) {
-        done();
-        return;
-      }
-      if (pending.turnParked.length) {
-        if (flushTimer) clearTimeout(flushTimer);
-        flushTimer = setTimeout(done, toolFlushGraceMs);
-      }
-    };
-    pending.notifyParked();
-  });
-}
-
-function currentParkedCallTimeoutMs() {
-  return parkedCallTimeoutMsOverride ?? parkedCallTimeoutMs;
+  return pendingRuntime.attachConsumerAndWait(pending, onEvent);
 }
 
 function ingestClientToolCall(body, response) {
-  const runToken = typeof body.runToken === "string" ? body.runToken.trim() : "";
-  const toolName = typeof body.toolName === "string" ? body.toolName : "";
-  const callId = typeof body.callId === "string" && body.callId.trim()
-    ? body.callId.trim()
-    : crypto.randomUUID();
-  const args = isRecord(body.arguments) ? body.arguments : {};
-  const pending = pendingRunForCallback(runToken, body.cacheKey);
-  if (!toolName || !pending || pending.evicted) {
-    return { accepted: false, callId };
-  }
-  const normalized = normalizeSDKToolCall({ type: toolName, args }, pending.input.clientTools);
-  if (!normalized) return { accepted: false, callId };
-  if (parkedMcpCalls.has(callId) || pending.parkedCallIds.has(callId)) {
-    return { accepted: false, callId };
-  }
-
-  const toolCall = { ...normalized, id: callId };
-  pending.parkedCallIds.add(callId);
-  const timeout = setTimeout(() => {
-    failParkedMcpCall(callId, "Parked client tool call timed out.");
-    evictPendingRun(pending, "parked_call_timeout");
-  }, currentParkedCallTimeoutMs());
-  parkedMcpCalls.set(callId, {
-    callId,
-    runToken: pending.runToken,
-    toolCall,
-    response,
-    timeout,
-    resolved: false
-  });
-  if (pending.consumer?.emit) {
-    pending.turnParked.push(toolCall);
-    pending.consumer.emit({ type: "tool_call", toolCall });
-  } else {
-    pending.buffered.push({ type: "tool_call", toolCall });
-  }
-  pending.notifyParked?.();
-  return { accepted: true, callId };
+  return pendingRuntime.ingestClientToolCall(body, response);
 }
 
 function resolveParkedMcpCall(callId, output) {
-  const parked = parkedMcpCalls.get(callId);
-  if (!parked || parked.resolved) return false;
-  parked.resolved = true;
-  clearTimeout(parked.timeout);
-  parkedMcpCalls.delete(callId);
-  const pending = pendingRunsByToken.get(parked.runToken);
-  pending?.parkedCallIds.delete(callId);
-  if (parked.response) {
-    writeJson(parked.response, {
-      ok: true,
-      accepted: true,
-      callId,
-      result: mcpToolResultFromOutput(output)
-    });
-  }
-  return true;
-}
-
-function failParkedMcpCall(callId, message) {
-  const parked = parkedMcpCalls.get(callId);
-  if (!parked || parked.resolved) return;
-  parked.resolved = true;
-  clearTimeout(parked.timeout);
-  parkedMcpCalls.delete(callId);
-  const pending = pendingRunsByToken.get(parked.runToken);
-  pending?.parkedCallIds.delete(callId);
-  if (parked.response) {
-    writeJson(parked.response, {
-      ok: true,
-      accepted: true,
-      callId,
-      result: {
-        content: [{ type: "text", text: message }],
-        isError: true
-      }
-    });
-  }
-}
-
-function mcpToolResultFromOutput(output) {
-  const text = typeof output === "string" ? output : JSON.stringify(output ?? "");
-  return {
-    content: [{ type: "text", text }],
-    isError: false
-  };
-}
-
-function evictPendingRun(pending, reason) {
-  if (!pending || pending.evicted) return;
-  pending.evicted = true;
-  for (const callId of [...pending.parkedCallIds]) {
-    failParkedMcpCall(callId, `Parked client tool call ended (${reason}).`);
-  }
-  pending.run?.cancel().catch(() => {});
-  forgetPendingRun(pending);
-  pending.notifyParked?.();
-}
-
-function forgetPendingRun(pending) {
-  if (pendingRunsBySession.get(pending.sessionKey) === pending) {
-    pendingRunsBySession.delete(pending.sessionKey);
-  }
-  if (pendingRunsByToken.get(pending.runToken) === pending) {
-    pendingRunsByToken.delete(pending.runToken);
-  }
-  if (pending.mcpToken && pendingRunsByToken.get(pending.mcpToken) === pending) {
-    pendingRunsByToken.delete(pending.mcpToken);
-  }
-}
-
-function pendingRunForCallback(runToken, cacheKeyValue) {
-  if (runToken && pendingRunsByToken.has(runToken)) {
-    return pendingRunsByToken.get(runToken);
-  }
-  const cacheKey = typeof cacheKeyValue === "string" ? cacheKeyValue.trim() : "";
-  if (!cacheKey) return undefined;
-  return [...pendingRunsBySession.values()].find((pending) => pending.cacheKey === cacheKey && !pending.evicted);
+  return pendingRuntime.resolveParkedMcpCall(callId, output);
 }
 
 async function getAgent(input) {
@@ -704,7 +438,7 @@ function clientForwardingMcpServers(clientTools = [], cacheKey = "", runToken = 
         CURSOR_SDK_BRIDGE_CALLBACK_TOKEN: bridgeToken,
         CURSOR_SDK_BRIDGE_AGENT_CACHE_KEY: cacheKey,
         CURSOR_SDK_BRIDGE_RUN_TOKEN: runToken,
-        CURSOR_SDK_BRIDGE_PARKED_CALL_TIMEOUT_MS: String(currentParkedCallTimeoutMs()),
+        CURSOR_SDK_BRIDGE_PARKED_CALL_TIMEOUT_MS: String(pendingRuntime.currentParkedCallTimeoutMs()),
         CURSOR_SDK_BRIDGE_CLIENT_TOOLS_JSON: JSON.stringify(clientMcpToolDefinitions(clientTools))
       }
     }
@@ -718,308 +452,9 @@ async function runClientForwardingMcpServerFromEnvironment() {
     callbackToken: process.env.CURSOR_SDK_BRIDGE_CALLBACK_TOKEN || "",
     callbackCacheKey: process.env.CURSOR_SDK_BRIDGE_AGENT_CACHE_KEY || "",
     callbackRunToken: process.env.CURSOR_SDK_BRIDGE_RUN_TOKEN || "",
-    parkedCallTimeoutMs: parseInteger(process.env.CURSOR_SDK_BRIDGE_PARKED_CALL_TIMEOUT_MS, 120 * 1000)
+    parkedCallTimeoutMs: parseInteger(process.env.CURSOR_SDK_BRIDGE_PARKED_CALL_TIMEOUT_MS, 120 * 1000),
+    validateClientMcpToolCall
   });
-}
-
-function parseClientMcpToolsJSON(value) {
-  if (typeof value !== "string" || !value.trim()) return clientMcpToolDefinitions([]);
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : clientMcpToolDefinitions([]);
-  } catch {
-    return clientMcpToolDefinitions([]);
-  }
-}
-
-async function runClientForwardingMcpServer({
-  tools,
-  callbackUrl,
-  callbackToken,
-  callbackCacheKey,
-  callbackRunToken,
-  parkedCallTimeoutMs: parkedTimeoutMs = 120 * 1000,
-  input = process.stdin,
-  output = process.stdout
-}) {
-  const rl = readline.createInterface({ input });
-  let outputClosed = false;
-  const writeOutput = (payload) => {
-    if (outputClosed) return false;
-    try {
-      return output.write(payload);
-    } catch (error) {
-      if (!isBenignPipeError(error)) throw error;
-      outputClosed = true;
-      return false;
-    }
-  };
-  output.on?.("error", (error) => {
-    outputClosed = true;
-    if (!isBenignPipeError(error)) process.exitCode = 1;
-  });
-  const send = (id, result) => {
-    if (id === undefined || id === null) return;
-    writeOutput(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
-  };
-  const sendError = (id, message) => {
-    if (id === undefined || id === null) return;
-    writeOutput(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message } })}\n`);
-  };
-  const pending = new Set();
-  const parkedReplies = new Map();
-
-  const handleLine = async (line) => {
-    if (!line.trim()) return;
-    let message;
-    try {
-      message = JSON.parse(line);
-    } catch {
-      return;
-    }
-    if (!message.id && String(message.method || "").startsWith("notifications/")) return;
-    if (message.method === "initialize") {
-      send(message.id, {
-        protocolVersion: "2024-11-05",
-        capabilities: { tools: {} },
-        serverInfo: { name: "api-for-cursor-client-tools", version: "0.1.0" }
-      });
-      return;
-    }
-    if (message.method === "tools/list") {
-      send(message.id, { tools });
-      return;
-    }
-    if (message.method === "tools/call") {
-      const params = message.params || {};
-      const toolName = params.name || params.toolName;
-      const toolInput = params.arguments || params.input || {};
-      const validationError = validateClientMcpToolCall(tools, toolName, toolInput);
-      if (validationError) {
-        sendError(message.id, validationError);
-        return;
-      }
-      const callId = crypto.randomUUID();
-      parkedReplies.set(callId, message.id);
-      const outcome = await notifyParentToolCall({
-        callbackUrl,
-        callbackToken,
-        callbackCacheKey,
-        callbackRunToken,
-        callId,
-        toolName,
-        input: toolInput,
-        timeoutMs: parkedTimeoutMs
-      });
-      parkedReplies.delete(callId);
-      if (!outcome || outcome.accepted !== true) {
-        sendError(message.id, "Outer client callback unavailable for forwarded tool call.");
-        return;
-      }
-      if (outcome.result) {
-        send(message.id, outcome.result);
-        return;
-      }
-      send(message.id, {
-        content: [{ type: "text", text: typeof outcome.output === "string" ? outcome.output : "" }],
-        isError: false
-      });
-      return;
-    }
-    sendError(message.id, `Unsupported MCP method: ${message.method}`);
-  };
-
-  await new Promise((resolve) => {
-    rl.on("line", (line) => {
-      const task = handleLine(line)
-        .catch((error) => {
-          if (!isBenignPipeError(error)) process.exitCode = 1;
-        })
-        .finally(() => {
-          pending.delete(task);
-        });
-      pending.add(task);
-    });
-    rl.on("close", async () => {
-      await Promise.allSettled([...pending]);
-      resolve();
-    });
-  });
-}
-
-async function notifyParentToolCall({
-  callbackUrl,
-  callbackToken,
-  callbackCacheKey,
-  callbackRunToken,
-  callId,
-  toolName,
-  input,
-  timeoutMs
-}) {
-  if (!callbackUrl || !callbackCacheKey) return { accepted: true, result: { content: [{ type: "text", text: "" }], isError: false } };
-  const controller = new AbortController();
-  // Child abort sits 5s past the parent parked-call timeout so the parent
-  // fails the MCP reply first.
-  const timer = setTimeout(() => controller.abort(), Math.max(1000, (timeoutMs || 120 * 1000) + 5000));
-  try {
-    const headers = { "Content-Type": "application/json" };
-    if (callbackToken) headers.Authorization = `Bearer ${callbackToken}`;
-    const response = await fetch(callbackUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        cacheKey: callbackCacheKey,
-        runToken: callbackRunToken,
-        callId,
-        toolName,
-        arguments: input && typeof input === "object" && !Array.isArray(input) ? input : {}
-      }),
-      signal: controller.signal
-    });
-    if (!response.ok) return { accepted: false };
-    const body = await response.json().catch(() => ({}));
-    return body && typeof body === "object" ? body : { accepted: false };
-  } catch {
-    return { accepted: false };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function clientForwardingMcpServerSource(clientTools = []) {
-  const tools = JSON.stringify(clientMcpToolDefinitions(clientTools));
-  return `
-const readline = require("node:readline");
-const { randomUUID } = require("node:crypto");
-const tools = ${tools};
-const callbackUrl = process.env.CURSOR_SDK_BRIDGE_CALLBACK_URL || "";
-const callbackToken = process.env.CURSOR_SDK_BRIDGE_CALLBACK_TOKEN || "";
-const callbackCacheKey = process.env.CURSOR_SDK_BRIDGE_AGENT_CACHE_KEY || "";
-const callbackRunToken = process.env.CURSOR_SDK_BRIDGE_RUN_TOKEN || "";
-const parkedCallTimeoutMs = Number.parseInt(process.env.CURSOR_SDK_BRIDGE_PARKED_CALL_TIMEOUT_MS || "", 10) || 120000;
-const parkedReplies = new Map();
-const validateClientMcpToolCall = ${validateClientMcpToolCall.toString()};
-const validateJsonSchemaValue = ${validateJsonSchemaValue.toString()};
-const canonicalJsonSchema = ${canonicalJsonSchema.toString()};
-const schemaHasStructuralKeyword = ${schemaHasStructuralKeyword.toString()};
-const schemaReferenceTarget = ${schemaReferenceTarget.toString()};
-const jsonPointerTarget = ${jsonPointerTarget.toString()};
-const decodeJsonPointerSegment = ${decodeJsonPointerSegment.toString()};
-const schemaTypes = ${schemaTypes.toString()};
-const schemaAllowsNull = ${schemaAllowsNull.toString()};
-const validateStringConstraints = ${validateStringConstraints.toString()};
-const validateNumberConstraints = ${validateNumberConstraints.toString()};
-const patternPropertySchemasForKey = ${patternPropertySchemasForKey.toString()};
-const schemaEvaluatesObjectProperty = ${schemaEvaluatesObjectProperty.toString()};
-const jsonValueMatchesType = ${jsonValueMatchesType.toString()};
-const jsonValuesEqual = ${jsonValuesEqual.toString()};
-const isRecord = ${isRecord.toString()};
-const stableJson = ${stableJson.toString()};
-const sortJson = ${sortJson.toString()};
-const rl = readline.createInterface({ input: process.stdin });
-let stdoutClosed = false;
-function isBenignPipeError(error) {
-  return error?.code === "EPIPE" || error?.code === "ERR_STREAM_DESTROYED";
-}
-function writeStdout(payload) {
-  if (stdoutClosed) return false;
-  try {
-    return process.stdout.write(payload);
-  } catch (error) {
-    if (!isBenignPipeError(error)) throw error;
-    stdoutClosed = true;
-    return false;
-  }
-}
-process.stdout.on("error", (error) => {
-  stdoutClosed = true;
-  if (isBenignPipeError(error)) process.exit(0);
-  process.exitCode = 1;
-});
-function send(id, result) {
-  if (id === undefined || id === null) return;
-  writeStdout(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\\n");
-}
-function sendError(id, message) {
-  if (id === undefined || id === null) return;
-  writeStdout(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message } }) + "\\n");
-}
-async function notifyParentToolCall(toolName, input, callId) {
-  if (!callbackUrl || !callbackCacheKey) return { accepted: true, result: { content: [{ type: "text", text: "" }], isError: false } };
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(1000, parkedCallTimeoutMs + 5000));
-  try {
-    const headers = { "Content-Type": "application/json" };
-    if (callbackToken) headers.Authorization = "Bearer " + callbackToken;
-    const response = await fetch(callbackUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        cacheKey: callbackCacheKey,
-        runToken: callbackRunToken,
-        callId,
-        toolName,
-        arguments: input && typeof input === "object" && !Array.isArray(input) ? input : {}
-      }),
-      signal: controller.signal
-    });
-    if (!response.ok) return { accepted: false };
-    const body = await response.json().catch(() => ({}));
-    return body && typeof body === "object" ? body : { accepted: false };
-  } catch {
-    return { accepted: false };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-rl.on("line", async (line) => {
-  if (!line.trim()) return;
-  let message;
-  try {
-    message = JSON.parse(line);
-  } catch {
-    return;
-  }
-  if (!message.id && String(message.method || "").startsWith("notifications/")) return;
-  if (message.method === "initialize") {
-    send(message.id, {
-      protocolVersion: "2024-11-05",
-      capabilities: { tools: {} },
-      serverInfo: { name: "api-for-cursor-client-tools", version: "0.1.0" }
-    });
-  } else if (message.method === "tools/list") {
-    send(message.id, { tools });
-  } else if (message.method === "tools/call") {
-    const params = message.params || {};
-    const toolName = params.name || params.toolName;
-    const input = params.arguments || params.input || {};
-    const validationError = validateClientMcpToolCall(tools, toolName, input);
-    if (validationError) {
-      sendError(message.id, validationError);
-      return;
-    }
-    const callId = randomUUID();
-    parkedReplies.set(callId, message.id);
-    const outcome = await notifyParentToolCall(toolName, input, callId);
-    parkedReplies.delete(callId);
-    if (!outcome || outcome.accepted !== true) {
-      sendError(message.id, "Outer client callback unavailable for forwarded tool call.");
-      return;
-    }
-    if (outcome.result) {
-      send(message.id, outcome.result);
-      return;
-    }
-    send(message.id, {
-      content: [{ type: "text", text: typeof outcome.output === "string" ? outcome.output : "" }],
-      isError: false
-    });
-  } else {
-    sendError(message.id, "Unsupported MCP method: " + message.method);
-  }
-});
-`;
 }
 
 function validateClientMcpToolCall(tools, toolName, input = {}) {
@@ -2404,6 +1839,37 @@ function hasDistinctIncrementalPrompt(prompt, incrementalPrompt) {
   return typeof incrementalPrompt === "string" && incrementalPrompt.trim() !== "" && incrementalPrompt !== prompt;
 }
 
+function finiteTokenCount(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined;
+}
+
+function normalizeTokenUsage(value) {
+  if (!isRecord(value)) return undefined;
+  const inputTokens = finiteTokenCount(value.inputTokens);
+  const outputTokens = finiteTokenCount(value.outputTokens);
+  if (inputTokens === undefined || outputTokens === undefined) return undefined;
+  const cacheReadTokens = finiteTokenCount(value.cacheReadTokens) ?? 0;
+  const cacheWriteTokens = finiteTokenCount(value.cacheWriteTokens) ?? 0;
+  const totalTokens = finiteTokenCount(value.totalTokens) ?? inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+  const reasoningTokens = finiteTokenCount(value.reasoningTokens);
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    totalTokens,
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {})
+  };
+}
+
+function pendingUsage(pending) {
+  return normalizeTokenUsage(pending.run?.usage) || pending.usage;
+}
+
+function usageField(usage) {
+  return usage ? { usage } : {};
+}
+
 function parseToolResults(value) {
   if (!Array.isArray(value)) return [];
   return value.flatMap((item) => {
@@ -2750,16 +2216,10 @@ function isMainModule() {
 }
 
 function _resetBridgeStateForTests() {
-  for (const pending of [...pendingRunsBySession.values()]) {
-    evictPendingRun(pending, "test_reset");
-  }
-  pendingRunsBySession.clear();
-  pendingRunsByToken.clear();
-  parkedMcpCalls.clear();
+  pendingRuntime.reset();
   agentCache.clear();
   agentRunQueues.clear();
   createAgentImpl = defaultCreateAgent;
-  parkedCallTimeoutMsOverride = undefined;
 }
 
 function _setCreateAgentForTests(factory) {
@@ -2767,5 +2227,5 @@ function _setCreateAgentForTests(factory) {
 }
 
 function _setParkedCallTimeoutMsForTests(value) {
-  parkedCallTimeoutMsOverride = value;
+  pendingRuntime.setParkedCallTimeoutMs(value);
 }

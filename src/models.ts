@@ -4,6 +4,8 @@ export interface ComposerModel {
   id: string;
   name: string;
   inputCost: number;
+  /** Cache-read price per million tokens (Cursor published). */
+  cacheReadCost: number;
   outputCost: number;
   contextWindow: number;
   outputLimit: number;
@@ -118,12 +120,12 @@ const PASSTHROUGH_REASONING: Array<{
 ];
 
 export const COMPOSER_MODELS: ComposerModel[] = [
-  { id: "composer-2.5", name: "Composer 2.5", inputCost: 0.5, outputCost: 2.5, contextWindow: 200_000, outputLimit: 65_536 },
-  { id: "composer-2.5-fast", name: "Composer 2.5 Fast", inputCost: 3, outputCost: 15, contextWindow: 200_000, outputLimit: 65_536 },
-  { id: "grok-4.6", name: "Grok 4.6", inputCost: 2, outputCost: 6, contextWindow: 256_000, outputLimit: 65_536 },
-  { id: "grok-4.6-fast", name: "Grok 4.6 Fast", inputCost: 4, outputCost: 12, contextWindow: 256_000, outputLimit: 65_536 },
-  { id: "grok-4.5", name: "Grok 4.5", inputCost: 2, outputCost: 6, contextWindow: 200_000, outputLimit: 65_536 },
-  { id: "grok-4.5-fast", name: "Grok 4.5 Fast", inputCost: 4, outputCost: 18, contextWindow: 200_000, outputLimit: 65_536 }
+  { id: "composer-2.5", name: "Composer 2.5", inputCost: 0.5, cacheReadCost: 0.2, outputCost: 2.5, contextWindow: 200_000, outputLimit: 65_536 },
+  { id: "composer-2.5-fast", name: "Composer 2.5 Fast", inputCost: 3, cacheReadCost: 0.5, outputCost: 15, contextWindow: 200_000, outputLimit: 65_536 },
+  { id: "grok-4.6", name: "Grok 4.6", inputCost: 2, cacheReadCost: 0.5, outputCost: 6, contextWindow: 256_000, outputLimit: 65_536 },
+  { id: "grok-4.6-fast", name: "Grok 4.6 Fast", inputCost: 4, cacheReadCost: 1, outputCost: 12, contextWindow: 256_000, outputLimit: 65_536 },
+  { id: "grok-4.5", name: "Grok 4.5", inputCost: 2, cacheReadCost: 0.5, outputCost: 6, contextWindow: 200_000, outputLimit: 65_536 },
+  { id: "grok-4.5-fast", name: "Grok 4.5 Fast", inputCost: 4, cacheReadCost: 1, outputCost: 18, contextWindow: 200_000, outputLimit: 65_536 }
 ];
 
 const EFFORT_SUFFIXES = [
@@ -392,6 +394,7 @@ export function agentModelDefinition(model: ComposerModel): Record<string, unkno
     name: model.name,
     cost: {
       input: model.inputCost,
+      cache_read: model.cacheReadCost,
       output: model.outputCost
     },
     limit: {

@@ -158,7 +158,7 @@ These OpenAI features are rejected because Cursor does not expose equivalent con
 
 `reasoning.effort` / `reasoning_effort` are supported for models that expose Cursor effort/reasoning params (see above).
 
-Token usage is estimated from character counts because Cursor's stream does not return OpenAI token accounting on this path. For all listed models, `usage.cost` is estimated from Cursor's published per-million-token pricing.
+When the Cursor SDK reports turn usage (`run.stream()` `{ type: "usage" }` or `run.wait().usage`), those token counts including `cacheReadTokens` are copied into OpenAI `usage`. Character-count estimates are the fallback when Cursor omits usage. `usage.cost` is still estimated from Cursor's published per-million-token rates (`estimated: true`), because billed cents from `agent.getUsage()` can lag or be zero on plan-included usage. Continuation turns without SDK usage still treat the `incrementalPrompt` prefix as a cache read.
 
 ## Development
 

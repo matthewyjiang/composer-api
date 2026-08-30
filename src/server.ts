@@ -17,6 +17,7 @@ import {
   responseToolCallEvents,
   toOpenAiToolCalls,
   incrementalContinuationPrompt,
+  cachedCharsFromIncremental,
   type OpenAiToolSpec,
   type PreparedRequest,
   type ToolCallContext
@@ -26,16 +27,13 @@ import { encodeSse } from "./sse.js";
 import { baseUrl, DISPLAY_NAME, resolveRequestApiKey, type AppConfig } from "./config.js";
 import { COMPOSER_MODELS, localModelList, modelById, modelObject, resolveCursorModel } from "./models.js";
 import { collectSdkOutput, runSdkStream, type SdkBridgeSettings } from "./sdk.js";
-import type { CursorTextEvent } from "./types.js";
+import { boundedTranscriptItems, hasSessionKey, matchPrefixSession, rememberPrefixSession, resetSessionIndex, touchSessionKey, type SessionPrefixMatch } from "./session-index.js";
+import type { CursorTextEvent, CursorTokenUsage } from "./types.js";
 import { createHash } from "node:crypto";
 
 // 512 stored responses is a few hours of Rho tool loops at one row per turn.
 // LRU already evicts; this is the tripwire, not a guess at peak RAM.
 const RESPONSE_STATE_LIMIT = 512;
-// 256 KiB covers a long tool-loop item list (~64k tokens of JSON). A 32 MiB
-// prompt must not be copied into all 512 slots; oversized states skip prefix
-// correlation and still match on previous_response_id / session affinity.
-const MAX_STORED_TRANSCRIPT_BYTES = 256 * 1024;
 const COMPACTION_INSTRUCTIONS = [
   "You are compacting a long-running local Responses API conversation.",
   "Return a concise continuation summary that preserves user goals, decisions, constraints, important file paths, pending tasks, tool results, and any unresolved errors.",
@@ -48,16 +46,8 @@ interface StoredResponseState {
   response?: Record<string, unknown>;
   inputItems: unknown[];
   outputItems: unknown[];
-  inputFingerprints: string[];
-  fullFingerprints: string[];
-  functionCallFingerprints: string[];
   sdkSessionKey?: string;
   updatedAt: number;
-}
-
-interface SessionPrefixMatch {
-  sessionKey: string;
-  newInputItems: unknown[];
 }
 
 export interface ServerContext {
@@ -216,7 +206,7 @@ async function handlePrepared(
   const affinity = sessionAffinity(request);
   const prefixMatch =
     kind === "responses" && state?.ownerKey && !state.previousState?.sdkSessionKey && !affinity
-      ? matchSessionByTranscriptPrefix(state.ownerKey, prepared)
+      ? matchPrefixSession(state.ownerKey, prepared.responseInputItems ?? [])
       : undefined;
   const sdkSessionKey =
     state?.previousState?.sdkSessionKey
@@ -224,10 +214,10 @@ async function handlePrepared(
     || prefixMatch?.sessionKey
     || conversationSeed(prepared)
     || id;
-  const knownSession = seenSessionKeys.has(sdkSessionKey)
+  const knownSession = hasSessionKey(sdkSessionKey)
     || Boolean(state?.previousState?.sdkSessionKey)
     || Boolean(prefixMatch);
-  rememberSessionKey(sdkSessionKey);
+  touchSessionKey(sdkSessionKey);
   const ready = attachIncrementalPrompt(prepared, knownSession, prefixMatch);
 
   if (ready.stream) {
@@ -250,6 +240,8 @@ async function handlePrepared(
         text: output.text,
         toolCalls,
         promptChars: ready.promptChars,
+        cachedChars: cachedCharsFromIncremental(ready.promptChars, ready.incrementalPrompt),
+        reportedUsage: output.usage,
         metadata: ready.responseMetadata
       })
     );
@@ -261,6 +253,8 @@ async function handlePrepared(
     text: output.text,
     toolCalls,
     promptChars: ready.promptChars,
+    cachedChars: cachedCharsFromIncremental(ready.promptChars, ready.incrementalPrompt),
+    reportedUsage: output.usage,
     metadata: ready.responseMetadata
   });
   if (state?.ownerKey) {
@@ -305,11 +299,12 @@ function streamPrepared(
     created,
     model: prepared.model,
     promptChars: prepared.promptChars,
+    cachedChars: cachedCharsFromIncremental(prepared.promptChars, prepared.incrementalPrompt),
     includeUsage: prepared.includeUsage,
     metadata: prepared.responseMetadata,
     tools: prepared.tools,
     context: prepared.toolContext,
-    onDone: async (text, _completionChars, toolCalls) => {
+    onDone: async (text, _completionChars, toolCalls, reportedUsage) => {
       if (kind === "responses" && ownerKey) {
         const completed = responseObject({
           id,
@@ -318,6 +313,8 @@ function streamPrepared(
           text,
           toolCalls,
           promptChars: prepared.promptChars,
+          cachedChars: cachedCharsFromIncremental(prepared.promptChars, prepared.incrementalPrompt),
+          reportedUsage,
           metadata: prepared.responseMetadata
         });
         storeResponseState(ownerKey, {
@@ -363,11 +360,12 @@ function streamOpenAiEvents(
     created: number;
     model: string;
     promptChars: number;
+    cachedChars?: number;
     includeUsage: boolean;
     metadata?: Record<string, unknown>;
     tools: OpenAiToolSpec[];
     context?: ToolCallContext;
-    onDone: (text: string, completionChars: number, toolCalls: ReturnType<typeof toOpenAiToolCalls>) => Promise<void>;
+    onDone: (text: string, completionChars: number, toolCalls: ReturnType<typeof toOpenAiToolCalls>, reportedUsage?: CursorTokenUsage) => Promise<void>;
     onError: (error: unknown) => Promise<void>;
   }
 ): Response {
@@ -380,6 +378,7 @@ function streamOpenAiEvents(
     const streamedToolCalls: ReturnType<typeof toOpenAiToolCalls> = [];
     let responseNextOutputIndex = 0;
     let responseTextOutputIndex: number | null = null;
+    let reportedUsage: CursorTokenUsage | undefined;
     try {
       if (kind === "chat") {
         await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, role: "assistant" }));
@@ -423,6 +422,7 @@ function streamOpenAiEvents(
           // Bridge tool turns send empty finalText. Keep streamed prose so
           // completed output_index matches the function_call already emitted.
           if (event.finalText) text = event.finalText;
+          if (event.usage) reportedUsage = event.usage;
         }
       }
 
@@ -436,6 +436,8 @@ function streamOpenAiEvents(
               created: input.created,
               model: input.model,
               promptChars: input.promptChars,
+              cachedChars: input.cachedChars,
+              reportedUsage,
               completionChars
             })
           );
@@ -451,11 +453,12 @@ function streamOpenAiEvents(
           ...input,
           text,
           toolCalls: streamedToolCalls,
+          reportedUsage,
           textStarted: responseTextOutputIndex !== null,
           textOutputIndex: responseTextOutputIndex ?? 0
         })) await writer.write(event);
       }
-      await input.onDone(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls);
+      await input.onDone(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls, reportedUsage);
     } catch (error) {
       await input.onError(error).catch(() => undefined);
       const message = error instanceof Error ? error.message : "Stream failed";
@@ -630,53 +633,6 @@ function sessionAffinity(request: Request): string | undefined {
   )?.trim() || undefined;
 }
 
-function matchSessionByTranscriptPrefix(ownerKey: string | undefined, prepared: PreparedRequest): SessionPrefixMatch | undefined {
-  if (!ownerKey) return undefined;
-  const currentItems = prepared.responseInputItems ?? [];
-  const current = fingerprintsForItems(currentItems);
-  if (!current.length) return undefined;
-  let best: { sessionKey: string; updatedAt: number; newInputItems: unknown[] } | undefined;
-  for (const stored of responseState.values()) {
-    if (stored.ownerKey !== ownerKey || !stored.sdkSessionKey) continue;
-    const inputPrefix = stored.inputFingerprints;
-    const fullPrefix = stored.fullFingerprints;
-    const outputCalls = stored.functionCallFingerprints;
-    const exactPrefix = fullPrefix.length > 0 && fingerprintPrefix(fullPrefix, current);
-    // Rho resends input items plus function_call_output, not assistant message
-    // output items. Require the stored input prefix and every stored function_call.
-    const inputAndCalls = inputPrefix.length > 0
-      && fingerprintPrefix(inputPrefix, current)
-      && outputCalls.every((call) => current.includes(call));
-    if (!exactPrefix && !inputAndCalls) continue;
-    const newInputItems = exactPrefix
-      ? currentItems.slice(fullPrefix.length)
-      : leftoverAfterInputAndCalls(currentItems, inputPrefix.length, outputCalls);
-    if (!best || stored.updatedAt > best.updatedAt) {
-      best = { sessionKey: stored.sdkSessionKey, updatedAt: stored.updatedAt, newInputItems };
-    }
-  }
-  return best ? { sessionKey: best.sessionKey, newInputItems: best.newInputItems } : undefined;
-}
-
-function leftoverAfterInputAndCalls(currentItems: unknown[], inputPrefixLength: number, outputCallFingerprints: string[]): unknown[] {
-  return currentItems.slice(inputPrefixLength).filter((item) => {
-    const fingerprint = JSON.stringify(canonicalResponseItem(item));
-    return !outputCallFingerprints.includes(fingerprint);
-  });
-}
-
-function fingerprintPrefix(prefix: string[], current: string[]): boolean {
-  if (current.length < prefix.length) return false;
-  for (let index = 0; index < prefix.length; index += 1) {
-    if (prefix[index] !== current[index]) return false;
-  }
-  return true;
-}
-
-function fingerprintsForItems(items: unknown[]): string[] {
-  return canonicalResponseItems(items).map((item) => JSON.stringify(item));
-}
-
 function attachIncrementalPrompt(
   prepared: PreparedRequest,
   knownSession: boolean,
@@ -692,84 +648,8 @@ function attachIncrementalPrompt(
   return { ...prepared, incrementalPrompt: incremental };
 }
 
-function canonicalResponseItems(items: unknown[]): unknown[] {
-  return items.map(canonicalResponseItem);
-}
-
-function canonicalResponseItem(item: unknown): unknown {
-  if (typeof item === "string") return { type: "input_text", text: item };
-  if (!isRecord(item)) return item;
-  const type = typeof item.type === "string" ? item.type : typeof item.role === "string" ? "message" : "unknown";
-  if (type === "message" || typeof item.role === "string") {
-    return {
-      type: "message",
-      role: typeof item.role === "string" ? item.role : "user",
-      text: contentTextForPrefix(item.content)
-    };
-  }
-  if (type === "function_call") {
-    return {
-      type: "function_call",
-      call_id: typeof item.call_id === "string" ? item.call_id : "",
-      name: typeof item.name === "string" ? item.name : "",
-      arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {})
-    };
-  }
-  if (type === "function_call_output") {
-    return {
-      type: "function_call_output",
-      call_id: typeof item.call_id === "string" ? item.call_id : "",
-      output: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "")
-    };
-  }
-  return { type, value: item };
-}
-
-function contentTextForPrefix(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return content == null ? "" : JSON.stringify(content);
-  return content.map((part) => {
-    if (typeof part === "string") return part;
-    if (isRecord(part) && typeof part.text === "string") return part.text;
-    return "";
-  }).join("");
-}
-
-function boundedTranscriptItems(items: unknown[]): unknown[] {
-  const json = JSON.stringify(items);
-  if (Buffer.byteLength(json) <= MAX_STORED_TRANSCRIPT_BYTES) return items;
-  return [];
-}
-
-const AGENT_MODE_SWITCH_USER = "Please switch to agent mode.";
-const SEEN_SESSION_LIMIT = 2048;
-const seenSessionKeys = new Set<string>();
-
-function rememberSessionKey(sessionKey: string) {
-  if (seenSessionKeys.has(sessionKey)) {
-    seenSessionKeys.delete(sessionKey);
-    seenSessionKeys.add(sessionKey);
-    return;
-  }
-  seenSessionKeys.add(sessionKey);
-  if (seenSessionKeys.size <= SEEN_SESSION_LIMIT) return;
-  const oldest = seenSessionKeys.values().next().value;
-  if (oldest) seenSessionKeys.delete(oldest);
-}
-
 function conversationSeed(prepared: PreparedRequest): string | undefined {
-  const text = prepared.prompt.text;
-  let user: string | undefined;
-  for (const match of text.matchAll(/\nUSER: (.+)/g)) {
-    const line = match[1]?.trim();
-    if (line && line !== AGENT_MODE_SWITCH_USER) {
-      user = line;
-      break;
-    }
-  }
-  const inputIdx = text.indexOf("\nINPUT:\n");
-  const inputFirst = inputIdx >= 0 ? text.slice(inputIdx + "\nINPUT:\n".length).split("\n")[0]?.trim() : undefined;
-  const seed = user || inputFirst;
+  const seed = prepared.conversationSeed?.trim();
   if (!seed) return undefined;
   return `conv_${createHash("sha256").update(seed).digest("hex").slice(0, 24)}`;
 }
@@ -804,21 +684,24 @@ function storeResponseState(
 ) {
   const storedInputItems = input.store ? boundedTranscriptItems(input.inputItems) : [];
   const storedOutputItems = boundedTranscriptItems(input.outputItems);
-  const canonicalOutput = canonicalResponseItems(storedOutputItems);
   responseState.set(responseStateKey(ownerKey, input.id), {
     ownerKey,
     id: input.id,
     response: input.store ? input.response : undefined,
     inputItems: storedInputItems,
     outputItems: storedOutputItems,
-    inputFingerprints: fingerprintsForItems(storedInputItems),
-    fullFingerprints: fingerprintsForItems([...storedInputItems, ...storedOutputItems]),
-    functionCallFingerprints: canonicalOutput
-      .filter((item) => isRecord(item) && item.type === "function_call")
-      .map((item) => JSON.stringify(item)),
     sdkSessionKey: input.sdkSessionKey,
     updatedAt: input.now
   });
+  if (input.sdkSessionKey && storedInputItems.length) {
+    rememberPrefixSession({
+      ownerKey,
+      sessionKey: input.sdkSessionKey,
+      inputItems: storedInputItems,
+      outputItems: storedOutputItems,
+      updatedAt: input.now
+    });
+  }
   if (responseState.size <= RESPONSE_STATE_LIMIT) return;
   const extra = [...responseState.entries()].sort((left, right) => left[1].updatedAt - right[1].updatedAt);
   for (const [key] of extra.slice(0, extra.length - RESPONSE_STATE_LIMIT)) {
@@ -849,5 +732,5 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 export function _resetResponseStateForTests(): void {
   responseState.clear();
-  seenSessionKeys.clear();
+  resetSessionIndex();
 }

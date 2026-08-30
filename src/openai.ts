@@ -1,7 +1,9 @@
+import { continuationFromBody, messagesAfterLastAssistant } from "./continuation.js";
 import { HttpError } from "./http.js";
 import { reasoningEffortFromBody, resolveCursorModel, type ResolvedCursorModel } from "./models.js";
 import { encodeSse } from "./sse.js";
-import type { CursorImage, CursorPrompt, CursorToolCall } from "./types.js";
+import { appendCompactToolRecords, appendSdkRoutingMap, compactJsonSchema, compactToolDescription } from "./tool-inventory.js";
+import type { CursorImage, CursorPrompt, CursorTokenUsage, CursorToolCall } from "./types.js";
 
 export type ApiKind = "chat" | "responses";
 
@@ -22,6 +24,8 @@ export interface PreparedRequest {
   responseInputItems?: unknown[];
   functionCallOutputs?: FunctionCallOutput[];
   toolContext?: ToolCallContext;
+  /** First real user/input text, used to seed a Cursor session without parsing the prompt. */
+  conversationSeed?: string;
 }
 
 export interface FunctionCallOutput {
@@ -57,6 +61,7 @@ interface ToolParameterSchemaShape {
 
 interface CursorModelPricing {
   input: number;
+  cacheRead: number;
   output: number;
   source: string;
 }
@@ -70,23 +75,24 @@ const sdkToolCallMemory = new Map<string, SdkToolCallMemory>();
 const SDK_TOOL_CALL_MEMORY_LIMIT = 2048;
 
 const CURSOR_COMPOSER_2_5_PRICING_SOURCE = "https://cursor.com/changelog/composer-2-5";
+const CURSOR_MODELS_PRICING_SOURCE = "https://cursor.com/docs/models-and-pricing";
 const CURSOR_MODEL_PRICING: Record<string, CursorModelPricing> = {
-  default: { input: 0.5, output: 2.5, source: CURSOR_COMPOSER_2_5_PRICING_SOURCE },
-  auto: { input: 0.5, output: 2.5, source: CURSOR_COMPOSER_2_5_PRICING_SOURCE },
-  "composer-latest": { input: 0.5, output: 2.5, source: CURSOR_COMPOSER_2_5_PRICING_SOURCE },
-  "composer-2.5": { input: 0.5, output: 2.5, source: CURSOR_COMPOSER_2_5_PRICING_SOURCE },
-  "composer-2.5-sdk": { input: 0.5, output: 2.5, source: CURSOR_COMPOSER_2_5_PRICING_SOURCE },
-  "composer-2-5": { input: 0.5, output: 2.5, source: CURSOR_COMPOSER_2_5_PRICING_SOURCE },
-  "composer-2.5-fast": { input: 3, output: 15, source: CURSOR_COMPOSER_2_5_PRICING_SOURCE },
-  "composer-2-5-fast": { input: 3, output: 15, source: CURSOR_COMPOSER_2_5_PRICING_SOURCE },
-  "grok-4.6": { input: 2, output: 6, source: "https://cursor.com/docs/models-and-pricing" },
-  "grok-4-6": { input: 2, output: 6, source: "https://cursor.com/docs/models-and-pricing" },
-  "grok-4.6-fast": { input: 4, output: 12, source: "https://cursor.com/docs/models-and-pricing" },
-  "grok-4-6-fast": { input: 4, output: 12, source: "https://cursor.com/docs/models-and-pricing" },
-  "grok-4.5": { input: 2, output: 6, source: "https://cursor.com/blog/grok-4-5" },
-  "grok-4-5": { input: 2, output: 6, source: "https://cursor.com/blog/grok-4-5" },
-  "grok-4.5-fast": { input: 4, output: 18, source: "https://cursor.com/blog/grok-4-5" },
-  "grok-4-5-fast": { input: 4, output: 18, source: "https://cursor.com/blog/grok-4-5" }
+  default: { input: 0.5, cacheRead: 0.2, output: 2.5, source: CURSOR_COMPOSER_2_5_PRICING_SOURCE },
+  auto: { input: 0.5, cacheRead: 0.2, output: 2.5, source: CURSOR_COMPOSER_2_5_PRICING_SOURCE },
+  "composer-latest": { input: 0.5, cacheRead: 0.2, output: 2.5, source: CURSOR_COMPOSER_2_5_PRICING_SOURCE },
+  "composer-2.5": { input: 0.5, cacheRead: 0.2, output: 2.5, source: CURSOR_COMPOSER_2_5_PRICING_SOURCE },
+  "composer-2.5-sdk": { input: 0.5, cacheRead: 0.2, output: 2.5, source: CURSOR_COMPOSER_2_5_PRICING_SOURCE },
+  "composer-2-5": { input: 0.5, cacheRead: 0.2, output: 2.5, source: CURSOR_COMPOSER_2_5_PRICING_SOURCE },
+  "composer-2.5-fast": { input: 3, cacheRead: 0.5, output: 15, source: CURSOR_COMPOSER_2_5_PRICING_SOURCE },
+  "composer-2-5-fast": { input: 3, cacheRead: 0.5, output: 15, source: CURSOR_COMPOSER_2_5_PRICING_SOURCE },
+  "grok-4.6": { input: 2, cacheRead: 0.5, output: 6, source: CURSOR_MODELS_PRICING_SOURCE },
+  "grok-4-6": { input: 2, cacheRead: 0.5, output: 6, source: CURSOR_MODELS_PRICING_SOURCE },
+  "grok-4.6-fast": { input: 4, cacheRead: 1, output: 12, source: CURSOR_MODELS_PRICING_SOURCE },
+  "grok-4-6-fast": { input: 4, cacheRead: 1, output: 12, source: CURSOR_MODELS_PRICING_SOURCE },
+  "grok-4.5": { input: 2, cacheRead: 0.5, output: 6, source: "https://cursor.com/blog/grok-4-5" },
+  "grok-4-5": { input: 2, cacheRead: 0.5, output: 6, source: "https://cursor.com/blog/grok-4-5" },
+  "grok-4.5-fast": { input: 4, cacheRead: 1, output: 18, source: "https://cursor.com/blog/grok-4-5" },
+  "grok-4-5-fast": { input: 4, cacheRead: 1, output: 18, source: "https://cursor.com/blog/grok-4-5" }
 };
 
 const SYSTEM_DIRECTIVE = [
@@ -194,7 +200,8 @@ export function prepareChatRequest(body: unknown, _cursorModel?: ResolvedCursorM
     requiresLocalTool: false,
     storeResponse: false,
     ...(functionCallOutputs.length ? { functionCallOutputs } : {}),
-    toolContext
+    toolContext,
+    ...(firstUserTextFromMessages(messages) ? { conversationSeed: firstUserTextFromMessages(messages) } : {})
   };
 }
 
@@ -273,7 +280,8 @@ export function prepareOpencodeSdkChatRequest(body: unknown, _cursorModel?: Reso
     requiresLocalTool: workspaceMutationRequired && !workspaceMutationDone,
     storeResponse: false,
     ...(functionCallOutputs.length ? { functionCallOutputs } : {}),
-    toolContext
+    toolContext,
+    ...(firstUserTextFromMessages(messages) ? { conversationSeed: firstUserTextFromMessages(messages) } : {})
   };
 }
 
@@ -343,7 +351,8 @@ export function prepareResponsesRequest(
     storeResponse,
     responseInputItems: normalizedResponseInputItems(record.input),
     ...(functionCallOutputs.length ? { functionCallOutputs } : {}),
-    toolContext
+    toolContext,
+    ...(firstUserTextFromResponseInput(record.input) ? { conversationSeed: firstUserTextFromResponseInput(record.input) } : {})
   };
 }
 
@@ -354,6 +363,8 @@ export function chatCompletionResponse(input: {
   text: string;
   toolCalls?: OpenAiToolCall[];
   promptChars: number;
+  cachedChars?: number;
+  reportedUsage?: CursorTokenUsage;
   metadata?: Record<string, unknown>;
 }): Record<string, unknown> {
   const toolCalls = input.toolCalls ?? [];
@@ -377,7 +388,7 @@ export function chatCompletionResponse(input: {
         finish_reason: toolCalls.length ? "tool_calls" : "stop"
       }
     ],
-    usage: usageFromChars(input.model, input.promptChars, completionChars),
+    usage: usageFromReport(input.model, input.promptChars, completionChars, input.cachedChars, input.reportedUsage),
     service_tier: "default",
     system_fingerprint: null,
     ...input.metadata
@@ -391,6 +402,8 @@ export function responseObject(input: {
   text: string;
   toolCalls?: OpenAiToolCall[];
   promptChars: number;
+  cachedChars?: number;
+  reportedUsage?: CursorTokenUsage;
   metadata?: Record<string, unknown>;
 }): Record<string, unknown> {
   const messageId = `msg_${input.id.slice(5)}`;
@@ -438,7 +451,7 @@ export function responseObject(input: {
     tool_choice: "auto",
     tools: [],
     truncation: "disabled",
-    usage: responseUsageFromChars(input.model, input.promptChars, outputChars),
+    usage: responseUsageFromReport(input.model, input.promptChars, outputChars, input.cachedChars, input.reportedUsage),
     user: null,
     metadata: {},
     ...input.metadata
@@ -524,6 +537,8 @@ export function chatUsageChunk(input: {
   created: number;
   model: string;
   promptChars: number;
+  cachedChars?: number;
+  reportedUsage?: CursorTokenUsage;
   completionChars: number;
 }): Uint8Array {
   return encodeSse({
@@ -533,7 +548,7 @@ export function chatUsageChunk(input: {
     model: input.model,
     system_fingerprint: null,
     choices: [],
-    usage: usageFromChars(input.model, input.promptChars, input.completionChars)
+    usage: usageFromReport(input.model, input.promptChars, input.completionChars, input.cachedChars, input.reportedUsage)
   });
 }
 
@@ -646,6 +661,8 @@ export function responseDoneEvents(input: {
   text: string;
   toolCalls?: OpenAiToolCall[];
   promptChars: number;
+  cachedChars?: number;
+  reportedUsage?: CursorTokenUsage;
   metadata?: Record<string, unknown>;
   textStarted?: boolean;
   textOutputIndex?: number;
@@ -833,7 +850,7 @@ function modelItem(id: string, name: string) {
     created: 1779148800,
     owned_by: "cursor",
     name,
-    ...(pricing ? { cost: { input: pricing.input, output: pricing.output } } : {})
+    ...(pricing ? { cost: { input: pricing.input, cache_read: pricing.cacheRead, output: pricing.output } } : {})
   };
 }
 
@@ -922,7 +939,7 @@ function appendResponsesToolInventory(transcript: string[], tools: OpenAiToolSpe
   if (hasCompatibleTool("shell", tools)) {
     transcript.push("A shell client tool is available. For general file creation or overwrite requests, prefer an SDK shell call using mkdir -p and a quoted heredoc.");
   }
-  appendCompactToolRecords(transcript, tools, routes, { includeSdkMcp: true });
+  appendCompactToolRecords(transcript, tools, routes, (tool) => toolInventoryRecord(tool, { includeSdkMcp: true }));
   appendSdkRoutingMap(transcript, routes);
   const selected = toolChoiceFunctionName(toolChoice);
   if (selected) {
@@ -945,43 +962,12 @@ function appendSdkToolInventory(transcript: string[], tools: OpenAiToolSpec[], t
     "When the user names a specific allowed client tool, use the matching SDK TOOL ROUTING MAP route and do not substitute a different tool.",
     "For general local work, prefer shell/read/write/edit/glob/grep/ls style tool requests when those capabilities are present."
   );
-  appendCompactToolRecords(transcript, tools, routes, { includeSdkMcp: true });
+  appendCompactToolRecords(transcript, tools, routes, (tool) => toolInventoryRecord(tool, { includeSdkMcp: true }));
   appendSdkRoutingMap(transcript, routes);
   if (isRecord(toolChoice) && toolChoice.type === "function" && isRecord(toolChoice.function) && typeof toolChoice.function.name === "string") {
     transcript.push(requestedToolHint(toolChoice.function.name));
   } else if (toolChoice === "required") {
     transcript.push("You must call at least one tool.");
-  }
-}
-
-function appendSdkRoutingMap(transcript: string[], routes: Record<string, unknown>[]) {
-  if (!routes.length) return;
-  transcript.push(
-    "SDK TOOL ROUTING MAP:",
-    "Use these SDK tool names; the adapter forwards them to the listed client tool and argument shape."
-  );
-  for (const route of routes) {
-    transcript.push(JSON.stringify(route));
-  }
-}
-
-function appendCompactToolRecords(
-  transcript: string[],
-  tools: OpenAiToolSpec[],
-  routes: Record<string, unknown>[],
-  options: { includeSdkMcp: boolean }
-) {
-  const routedClients = new Set(
-    routes.flatMap((route) => (
-      typeof route.client === "string" && route.sdk !== "mcp" ? [route.client] : []
-    ))
-  );
-  for (const tool of tools) {
-    transcript.push(JSON.stringify(
-      routedClients.has(tool.name)
-        ? routedToolInventoryRecord(tool)
-        : toolInventoryRecord(tool, options)
-    ));
   }
 }
 
@@ -1047,52 +1033,6 @@ function toolInventoryRecord(tool: OpenAiToolSpec, options: { includeSdkMcp: boo
         }
       : {})
   };
-}
-
-function routedToolInventoryRecord(tool: OpenAiToolSpec): Record<string, unknown> {
-  const description = compactToolDescription(tool.description);
-  return {
-    name: tool.name,
-    ...(description ? { description } : {}),
-    via: "SDK TOOL ROUTING MAP"
-  };
-}
-
-const TOOL_DESCRIPTION_LIMIT = 160;
-const SCHEMA_NOISE_KEYS = new Set([
-  "$schema",
-  "$id",
-  "$comment",
-  "title",
-  "examples",
-  "default",
-  "markdownDescription"
-]);
-
-function compactToolDescription(description: string | undefined): string | undefined {
-  if (typeof description !== "string") return undefined;
-  const trimmed = description.replace(/\s+/g, " ").trim();
-  if (!trimmed) return undefined;
-  return trimmed.length > TOOL_DESCRIPTION_LIMIT ? `${trimmed.slice(0, TOOL_DESCRIPTION_LIMIT - 3)}...` : trimmed;
-}
-
-function compactJsonSchema(value: unknown, depth = 0): unknown {
-  if (Array.isArray(value)) return value.map((item) => compactJsonSchema(item, depth + 1));
-  if (!isRecord(value)) return value;
-  const compact: Record<string, unknown> = {};
-  for (const [key, nested] of Object.entries(value)) {
-    if (SCHEMA_NOISE_KEYS.has(key)) continue;
-    if (key === "description") {
-      if (depth === 0) {
-        const description = compactToolDescription(typeof nested === "string" ? nested : undefined);
-        if (description) compact.description = description;
-      }
-      continue;
-    }
-    if (key === "additionalProperties" && nested === true) continue;
-    compact[key] = compactJsonSchema(nested, depth + 1);
-  }
-  return compact;
 }
 
 function directToolChoiceHint(toolName: string): string {
@@ -1299,14 +1239,7 @@ function appendJsonConstraint(constraints: string[], format: unknown) {
 function responsesContinuationPrompt(input: unknown, tools: OpenAiToolSpec[]): { text?: string; images: CursorImage[] } {
   const { text, images } = responseInputToTextAndImages(input, tools);
   if (!text.trim() || images.length) return { images };
-  return {
-    text: [
-      "This Cursor session already has the earlier conversation. Continue from this new input only:",
-      "",
-      text
-    ].join("\n"),
-    images
-  };
+  return { text: continuationFromBody(text), images };
 }
 
 export function incrementalContinuationPrompt(input: unknown, tools: OpenAiToolSpec[] = []): string | undefined {
@@ -1322,18 +1255,11 @@ function chatContinuationPrompt(
     toolCallById?: Map<string, { name: string; args: Record<string, unknown> }>;
   } = {}
 ): string | undefined {
-  const items = messages.map((message) => expectRecord(message, "messages[]"));
-  let start = 0;
-  for (let index = 0; index < items.length; index += 1) {
-    if (items[index].role === "assistant") start = index + 1;
-  }
-  if (start === 0 || start >= items.length) return undefined;
-  const lines = [
-    "This Cursor session already has the earlier conversation. Continue from this new input only:",
-    ""
-  ];
+  const items = messagesAfterLastAssistant(messages).map((message) => expectRecord(message, "messages[]"));
+  if (!items.length) return undefined;
+  const lines: string[] = [];
   const toolCallById = options.toolCallById ?? new Map<string, { name: string; args: Record<string, unknown> }>();
-  for (const item of items.slice(start)) {
+  for (const item of items) {
     const role = typeof item.role === "string" ? item.role : "user";
     const { text } = contentToTextAndImages(item.content, role);
     if (role === "tool") {
@@ -1352,7 +1278,7 @@ function chatContinuationPrompt(
       lines.push(`${role.toUpperCase()} TOOL_CALLS: ${JSON.stringify(item.tool_calls)}`);
     }
   }
-  return lines.join("\n");
+  return continuationFromBody(lines.join("\n"));
 }
 
 export function functionCallOutputsFromInput(input: unknown): FunctionCallOutput[] {
@@ -1542,6 +1468,15 @@ function latestUserTextFromMessages(messages: unknown[]): string {
   return "";
 }
 
+function firstUserTextFromMessages(messages: unknown[]): string | undefined {
+  for (const message of messages) {
+    if (!isRecord(message) || message.role !== "user") continue;
+    const text = contentToPlainText(message.content).trim();
+    if (text) return text;
+  }
+  return undefined;
+}
+
 function latestUserTextFromResponseInput(input: unknown): string {
   if (typeof input === "string") return input;
   if (!Array.isArray(input)) return "";
@@ -1554,6 +1489,33 @@ function latestUserTextFromResponseInput(input: unknown): string {
     }
   }
   return "";
+}
+
+function firstUserTextFromResponseInput(input: unknown): string | undefined {
+  if (typeof input === "string") {
+    const text = input.split("\n")[0]?.trim();
+    return text || undefined;
+  }
+  for (const item of responseInputArray(input)) {
+    if (typeof item === "string") {
+      const text = item.trim();
+      if (text) return text;
+      continue;
+    }
+    if (!isRecord(item)) continue;
+    if (item.type === "input_text" && typeof item.text === "string") {
+      const text = item.text.trim();
+      if (text) return text;
+      continue;
+    }
+    if (item.type === "message" || typeof item.role === "string") {
+      const role = typeof item.role === "string" ? item.role : "user";
+      if (role !== "user") continue;
+      const text = contentToPlainText(item.content).trim();
+      if (text) return text;
+    }
+  }
+  return undefined;
 }
 
 function hasWorkspaceMutationToolCall(messages: unknown[], tools: OpenAiToolSpec[] = []): boolean {
@@ -2180,50 +2142,147 @@ function imageFromUrl(url: string, metadata?: Record<string, unknown>): CursorIm
   return { url, ...(dimension ? { dimension } : {}) };
 }
 
-function usageFromChars(model: string, promptChars: number, completionChars: number) {
-  const promptTokens = estimateTokens(promptChars);
-  const completionTokens = estimateTokens(completionChars);
+/** Prefix already in a reused Cursor session. Incremental length is the cache miss. */
+export function cachedCharsFromIncremental(promptChars: number, incrementalPrompt?: string): number {
+  if (!incrementalPrompt || incrementalPrompt.length >= promptChars) return 0;
+  return promptChars - incrementalPrompt.length;
+}
+
+export function parseCursorTokenUsage(value: unknown): CursorTokenUsage | undefined {
+  if (!isRecord(value)) return undefined;
+  const inputTokens = finiteTokenCount(value.inputTokens);
+  const outputTokens = finiteTokenCount(value.outputTokens);
+  if (inputTokens === undefined || outputTokens === undefined) return undefined;
+  const cacheReadTokens = finiteTokenCount(value.cacheReadTokens) ?? 0;
+  const cacheWriteTokens = finiteTokenCount(value.cacheWriteTokens) ?? 0;
+  const totalTokens = finiteTokenCount(value.totalTokens) ?? inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+  const reasoningTokens = finiteTokenCount(value.reasoningTokens);
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    totalTokens,
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {})
+  };
+}
+
+function finiteTokenCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined;
+}
+
+/** OpenAI prompt_tokens include cache hits. Cursor lists input and cache-read separately. */
+function promptTokensFromReported(usage: CursorTokenUsage): { promptTokens: number; cachedTokens: number } {
+  const cachedTokens = usage.cacheReadTokens;
+  const inputIncludesCache =
+    cachedTokens > 0 &&
+    usage.inputTokens >= cachedTokens &&
+    usage.totalTokens === usage.inputTokens + usage.outputTokens;
+  const promptTokens = inputIncludesCache ? usage.inputTokens : usage.inputTokens + cachedTokens;
+  return { promptTokens, cachedTokens: Math.min(cachedTokens, promptTokens) };
+}
+
+function usageFromReport(
+  model: string,
+  promptChars: number,
+  completionChars: number,
+  cachedChars = 0,
+  reported?: CursorTokenUsage
+) {
+  if (!reported) return usageFromChars(model, promptChars, completionChars, cachedChars);
+  const { promptTokens, cachedTokens } = promptTokensFromReported(reported);
+  const completionTokens = reported.outputTokens;
   return {
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
     total_tokens: promptTokens + completionTokens,
-    prompt_tokens_details: { cached_tokens: 0, audio_tokens: 0 },
+    prompt_tokens_details: { cached_tokens: cachedTokens, audio_tokens: 0 },
+    completion_tokens_details: {
+      reasoning_tokens: reported.reasoningTokens ?? 0,
+      audio_tokens: 0,
+      accepted_prediction_tokens: 0,
+      rejected_prediction_tokens: 0
+    },
+    cost: costFromTokens(model, promptTokens, completionTokens, cachedTokens)
+  };
+}
+
+function responseUsageFromReport(
+  model: string,
+  inputChars: number,
+  outputChars: number,
+  cachedChars = 0,
+  reported?: CursorTokenUsage
+) {
+  if (!reported) return responseUsageFromChars(model, inputChars, outputChars, cachedChars);
+  const { promptTokens, cachedTokens } = promptTokensFromReported(reported);
+  const outputTokens = reported.outputTokens;
+  return {
+    input_tokens: promptTokens,
+    input_tokens_details: { cached_tokens: cachedTokens },
+    output_tokens: outputTokens,
+    output_tokens_details: { reasoning_tokens: reported.reasoningTokens ?? 0 },
+    total_tokens: promptTokens + outputTokens,
+    cost: costFromTokens(model, promptTokens, outputTokens, cachedTokens)
+  };
+}
+
+function cachedTokensFromChars(promptTokens: number, cachedChars = 0): number {
+  if (cachedChars <= 0) return 0;
+  return Math.min(promptTokens, estimateTokens(cachedChars));
+}
+
+function usageFromChars(model: string, promptChars: number, completionChars: number, cachedChars = 0) {
+  const promptTokens = estimateTokens(promptChars);
+  const completionTokens = estimateTokens(completionChars);
+  const cachedTokens = cachedTokensFromChars(promptTokens, cachedChars);
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
+    prompt_tokens_details: { cached_tokens: cachedTokens, audio_tokens: 0 },
     completion_tokens_details: {
       reasoning_tokens: 0,
       audio_tokens: 0,
       accepted_prediction_tokens: 0,
       rejected_prediction_tokens: 0
     },
-    cost: costFromTokens(model, promptTokens, completionTokens)
+    cost: costFromTokens(model, promptTokens, completionTokens, cachedTokens)
   };
 }
 
-function responseUsageFromChars(model: string, inputChars: number, outputChars: number) {
+function responseUsageFromChars(model: string, inputChars: number, outputChars: number, cachedChars = 0) {
   const inputTokens = estimateTokens(inputChars);
   const outputTokens = estimateTokens(outputChars);
+  const cachedTokens = cachedTokensFromChars(inputTokens, cachedChars);
   return {
     input_tokens: inputTokens,
-    input_tokens_details: { cached_tokens: 0 },
+    input_tokens_details: { cached_tokens: cachedTokens },
     output_tokens: outputTokens,
     output_tokens_details: { reasoning_tokens: 0 },
     total_tokens: inputTokens + outputTokens,
-    cost: costFromTokens(model, inputTokens, outputTokens)
+    cost: costFromTokens(model, inputTokens, outputTokens, cachedTokens)
   };
 }
 
-function costFromTokens(model: string, inputTokens: number, outputTokens: number) {
+function costFromTokens(model: string, inputTokens: number, outputTokens: number, cachedTokens = 0) {
   const pricing = pricingForModel(model);
   if (!pricing) return null;
-  const inputUsd = roundUsd((inputTokens / 1_000_000) * pricing.input);
+  const cached = Math.min(Math.max(0, cachedTokens), inputTokens);
+  const uncached = inputTokens - cached;
+  const inputUsd = roundUsd((uncached / 1_000_000) * pricing.input + (cached / 1_000_000) * pricing.cacheRead);
+  const cacheReadUsd = roundUsd((cached / 1_000_000) * pricing.cacheRead);
   const outputUsd = roundUsd((outputTokens / 1_000_000) * pricing.output);
   return {
     currency: "USD",
     estimated: true,
     input_usd: inputUsd,
+    cache_read_usd: cacheReadUsd,
     output_usd: outputUsd,
     total_usd: roundUsd(inputUsd + outputUsd),
     pricing: {
       input_per_million_tokens_usd: pricing.input,
+      cache_read_per_million_tokens_usd: pricing.cacheRead,
       output_per_million_tokens_usd: pricing.output,
       source: pricing.source
     }

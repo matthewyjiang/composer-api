@@ -71,6 +71,43 @@ describe("local OpenAI server", () => {
     expect(body.choices[0].message.content).toBe("Hello from Composer.");
   });
 
+  it("uses Cursor SDK token usage when the stream reports it", async () => {
+    async function* run(): AsyncGenerator<CursorTextEvent> {
+      yield { type: "text", text: "ok" };
+      yield {
+        type: "done",
+        finalText: "ok",
+        toolCalls: [],
+        usage: {
+          inputTokens: 200,
+          outputTokens: 10,
+          cacheReadTokens: 800,
+          cacheWriteTokens: 0,
+          totalTokens: 1010
+        }
+      };
+    }
+    const response = await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          messages: [{ role: "user", content: "Hello" }]
+        })
+      }),
+      context(run)
+    );
+    const body = await response.json() as {
+      usage: { prompt_tokens: number; completion_tokens: number; prompt_tokens_details: { cached_tokens: number } };
+    };
+    expect(body.usage).toMatchObject({
+      prompt_tokens: 1000,
+      completion_tokens: 10,
+      prompt_tokens_details: { cached_tokens: 800 }
+    });
+  });
+
   it("returns a responses object and stores it for GET", async () => {
     _resetResponseStateForTests();
     const created = await request("/v1/responses", {

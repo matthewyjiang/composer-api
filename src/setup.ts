@@ -174,7 +174,7 @@ async function installPi(ctx: SetupContext): Promise<SetupResult> {
       cost: {
         input: model.inputCost,
         output: model.outputCost,
-        cacheRead: 0,
+        cacheRead: model.cacheReadCost,
         cacheWrite: 0
       },
       compat: {
@@ -220,9 +220,11 @@ function clineModelInfo(id: string): Record<string, unknown> {
     maxTokens: model.outputLimit,
     contextWindow: model.contextWindow,
     supportsImages: true,
-    supportsPromptCache: false,
+    supportsPromptCache: true,
     inputPrice: model.inputCost,
     outputPrice: model.outputCost,
+    cacheReadsPrice: model.cacheReadCost,
+    cacheWritesPrice: 0,
     temperature: 0,
     supportsTools: true,
     supportsStreaming: true,

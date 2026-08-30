@@ -145,4 +145,21 @@ describe("runSdkStream", () => {
     expect(body?.incrementalPrompt).toBeUndefined();
     expect(events.at(-1)).toMatchObject({ type: "done", finalText: "ok" });
   });
+
+  it("forwards Cursor token usage from the done output", async () => {
+    const usage = {
+      inputTokens: 12,
+      outputTokens: 3,
+      cacheReadTokens: 40,
+      cacheWriteTokens: 0,
+      totalTokens: 55
+    };
+    globalThis.fetch = async () =>
+      new Response(ndjsonStream([JSON.stringify({ type: "done", output: { text: "ok", toolCalls: [], usage } })]), {
+        status: 200
+      });
+    const events = [];
+    for await (const event of runSdkStream(settings, input())) events.push(event);
+    expect(events.at(-1)).toMatchObject({ type: "done", finalText: "ok", usage });
+  });
 });

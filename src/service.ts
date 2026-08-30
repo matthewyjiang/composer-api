@@ -183,8 +183,10 @@ export async function userServiceStatus(options: ServiceCommandOptions = {}): Pr
   const home = options.home ?? os.homedir();
   const unitPath = userUnitPath(env, home);
   const run = options.run ?? runCommand;
-  const status = await runSystemctl(run, ["status", "--no-pager", SERVICE_UNIT]);
-  const enabledCheck = await runSystemctl(run, ["is-enabled", SERVICE_UNIT]);
+  const [status, enabledCheck] = await Promise.all([
+    runSystemctl(run, ["status", "--no-pager", SERVICE_UNIT]),
+    runSystemctl(run, ["is-enabled", SERVICE_UNIT])
+  ]);
   const detail =
     [status.stdout, status.stderr].map((part) => part.trim()).filter(Boolean).join("\n") ||
     `systemctl --user status ${SERVICE_UNIT} exited ${status.code}`;
