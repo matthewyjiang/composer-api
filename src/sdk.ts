@@ -26,6 +26,7 @@ export interface SdkRunInput {
   workingDirectory?: string;
   tools: OpenAiToolSpec[];
   requiresLocalTool: boolean;
+  toolResults?: Array<{ call_id: string; output: string }>;
 }
 
 export interface SdkRunOutput {
@@ -145,7 +146,8 @@ async function* runSdkBridgeOnce(
       sessionKey: input.sessionKey,
       workingDirectory: input.workingDirectory ?? "",
       streamEvents: true,
-      tools: input.tools
+      tools: input.tools,
+      ...(input.toolResults?.length ? { toolResults: input.toolResults } : {})
     })
   });
 
@@ -256,7 +258,8 @@ function asToolCall(value: unknown): CursorToolCall | undefined {
   if (!isRecord(value) || typeof value.name !== "string") return undefined;
   return {
     name: value.name,
-    arguments: isRecord(value.arguments) ? value.arguments : {}
+    arguments: isRecord(value.arguments) ? value.arguments : {},
+    ...(typeof value.id === "string" && value.id.trim() ? { id: value.id.trim() } : {})
   };
 }
 

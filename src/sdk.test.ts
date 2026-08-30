@@ -99,6 +99,22 @@ describe("runSdkStream", () => {
     ]);
   });
 
+  it("posts function_call_output toolResults to the bridge", async () => {
+    let body: Record<string, unknown> | undefined;
+    globalThis.fetch = async (_url, init) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(ndjsonStream([JSON.stringify({ type: "done", output: { text: "ok", toolCalls: [] } })]), {
+        status: 200
+      });
+    };
+    for await (const _event of runSdkStream(settings, input({
+      toolResults: [{ call_id: "call_1", output: "README.md" }]
+    }))) {
+      // drain
+    }
+    expect(body?.toolResults).toEqual([{ call_id: "call_1", output: "README.md" }]);
+  });
+
   it("omits incrementalPrompt when it matches the full prompt", async () => {
     let body: Record<string, unknown> | undefined;
     globalThis.fetch = async (_url, init) => {

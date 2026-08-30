@@ -20,7 +20,13 @@ export interface PreparedRequest {
   previousResponseId?: string;
   storeResponse?: boolean;
   responseInputItems?: unknown[];
+  functionCallOutputs?: FunctionCallOutput[];
   toolContext?: ToolCallContext;
+}
+
+export interface FunctionCallOutput {
+  call_id: string;
+  output: string;
 }
 
 export interface OpenAiToolSpec {
@@ -147,6 +153,7 @@ export function prepareChatRequest(body: unknown, _cursorModel?: ResolvedCursorM
   transcript.push("", "Conversation:");
   if (agentMode) transcript.push(...AGENT_MODE_PRIMER);
   const images: CursorImage[] = [];
+  const functionCallOutputs: FunctionCallOutput[] = [];
   for (const message of messages) {
     const item = expectRecord(message, "messages[]");
     const role = typeof item.role === "string" ? item.role : "user";
@@ -157,6 +164,7 @@ export function prepareChatRequest(body: unknown, _cursorModel?: ResolvedCursorM
       const toolName = typeof item.name === "string" ? item.name : "";
       const label = [toolName ? `name=${toolName}` : "", toolCallId ? `tool_call_id=${toolCallId}` : ""].filter(Boolean).join(" ");
       transcript.push(`TOOL RESULT${label ? ` (${label})` : ""}: ${text || "[empty]"}`);
+      if (toolCallId) functionCallOutputs.push({ call_id: toolCallId, output: text || "" });
     } else {
       transcript.push(`${role.toUpperCase()}: ${workspaceMutationRequired && role === "user" ? addWorkspaceActionToUserText(text) : text || "[empty]"}`);
     }
@@ -181,6 +189,7 @@ export function prepareChatRequest(body: unknown, _cursorModel?: ResolvedCursorM
     tools,
     requiresLocalTool: false,
     storeResponse: false,
+    ...(functionCallOutputs.length ? { functionCallOutputs } : {}),
     toolContext
   };
 }
@@ -216,6 +225,7 @@ export function prepareOpencodeSdkChatRequest(body: unknown, _cursorModel?: Reso
 
   const images: CursorImage[] = [];
   const toolCallById = new Map<string, { name: string; args: Record<string, unknown> }>();
+  const functionCallOutputs: FunctionCallOutput[] = [];
   for (const message of messages) {
     const item = expectRecord(message, "messages[]");
     const role = typeof item.role === "string" ? item.role : "user";
@@ -227,6 +237,7 @@ export function prepareOpencodeSdkChatRequest(body: unknown, _cursorModel?: Reso
       const label = [toolName ? `name=${toolName}` : "", toolCallId ? `tool_call_id=${toolCallId}` : ""].filter(Boolean).join(" ");
       transcript.push(`TOOL RESULT${label ? ` (${label})` : ""}: ${text || "[empty]"}`);
       transcript.push(`LOCAL OPENCODE TOOL RESULT: ${JSON.stringify(sdkToolResultFeedback(toolCallId, toolName, text, toolCallById, tools))}`);
+      if (toolCallId) functionCallOutputs.push({ call_id: toolCallId, output: text || "" });
     } else {
       transcript.push(`${role.toUpperCase()}: ${text || "[empty]"}`);
     }
@@ -252,6 +263,7 @@ export function prepareOpencodeSdkChatRequest(body: unknown, _cursorModel?: Reso
     tools,
     requiresLocalTool: workspaceMutationRequired && !workspaceMutationDone,
     storeResponse: false,
+    ...(functionCallOutputs.length ? { functionCallOutputs } : {}),
     toolContext
   };
 }
@@ -296,6 +308,7 @@ export function prepareResponsesRequest(
   const continuation = continuing ? responsesContinuationPrompt(record.input, tools) : undefined;
   const incrementalPrompt =
     continuation?.text && continuation.text !== prompt ? continuation.text : undefined;
+  const functionCallOutputs = functionCallOutputsFromInput(record.input);
   return {
     model,
     cursorModel,
@@ -320,6 +333,7 @@ export function prepareResponsesRequest(
     previousResponseId,
     storeResponse,
     responseInputItems: normalizedResponseInputItems(record.input),
+    ...(functionCallOutputs.length ? { functionCallOutputs } : {}),
     toolContext
   };
 }
@@ -738,7 +752,9 @@ export function toOpenAiToolCalls(input: {
     const sdkCanonical = canonicalToolName(normalizedToolCall.name);
     const toolArguments = normalizeToolArguments(normalizedToolCall.arguments ?? {}, tool, normalizedToolCall.name, 0, input.context);
     if (tool && !toolArgumentsSatisfySchema(toolArguments, tool)) return [];
-    const id = `call_${input.responseId.replace(/[^A-Za-z0-9]/g, "").slice(-18)}_${sdkCanonical}_${index}`;
+    const id = (typeof normalizedToolCall.id === "string" && normalizedToolCall.id.trim())
+      ? normalizedToolCall.id.trim()
+      : `call_${input.responseId.replace(/[^A-Za-z0-9]/g, "").slice(-18)}_${sdkCanonical}_${index}`;
     rememberSdkToolCall(id, normalizedToolCall.name, normalizedToolCall.arguments ?? {});
     return [{
       id,
@@ -794,7 +810,7 @@ function normalizeSdkToolCall(toolCall: CursorToolCall): CursorToolCall {
       const nextArgs: Record<string, unknown> = { ...args, path, fileText: streamContent };
       delete nextArgs.streamContent;
       delete nextArgs.stream_content;
-      return { name: "write", arguments: nextArgs };
+      return { name: "write", arguments: nextArgs, ...(toolCall.id ? { id: toolCall.id } : {}) };
     }
   }
   return toolCall;
@@ -1218,6 +1234,17 @@ function responsesContinuationPrompt(input: unknown, tools: OpenAiToolSpec[]): {
     ].join("\n"),
     images
   };
+}
+
+export function functionCallOutputsFromInput(input: unknown): FunctionCallOutput[] {
+  const outputs: FunctionCallOutput[] = [];
+  for (const item of responseInputArray(input)) {
+    if (!isRecord(item) || item.type !== "function_call_output") continue;
+    const callId = typeof item.call_id === "string" ? item.call_id.trim() : "";
+    if (!callId) continue;
+    outputs.push({ call_id: callId, output: responseToolOutputText(item.output) });
+  }
+  return outputs;
 }
 
 function responseInputToTextAndImages(input: unknown, tools: OpenAiToolSpec[] = []): { text: string; images: CursorImage[] } {

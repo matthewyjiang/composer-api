@@ -1439,6 +1439,17 @@ describe("OpenAI compatibility adapter", () => {
     expect(responses.prompt.text).toContain("Independent inspections can be requested together in one turn");
   });
 
+  it("extracts function_call_output items for parked MCP replies", () => {
+    const prepared = prepareResponsesRequest({
+      model: "composer-2.5",
+      input: [
+        { type: "message", role: "user", content: "hi" },
+        { type: "function_call_output", call_id: "call_parked", output: "README.md" }
+      ]
+    });
+    expect(prepared.functionCallOutputs).toEqual([{ call_id: "call_parked", output: "README.md" }]);
+  });
+
   it("sets a continuation incrementalPrompt from new Responses input only", () => {
     const prepared = prepareResponsesRequest(
       {
