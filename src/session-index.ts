@@ -1,16 +1,18 @@
+import { canonicalizeItem, matchTranscriptPrefix, responseInputItems } from "./transcript-prefix.js";
+
 const SEEN_SESSION_LIMIT = 2048;
-const MAX_STORED_TRANSCRIPT_BYTES = 256 * 1024;
+// Rho-style clients replay the whole transcript every request; a 200k-token
+// session is ~1 MiB of JSON. The old 256 KiB cap silently disabled prefix
+// matching (and so prompt caching) exactly when sessions grew long enough for
+// caching to matter. Bound per-entry size generously and enforce a global
+// budget with LRU eviction instead.
+const MAX_STORED_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
+const MAX_TOTAL_TRANSCRIPT_BYTES = 128 * 1024 * 1024;
 
 export interface SessionPrefixMatch {
   sessionKey: string;
-  newInputItems: unknown[];
   inputItems: unknown[];
   outputItems: unknown[];
-}
-
-export interface TranscriptLeftover {
-  leftover: unknown[];
-  matched: boolean;
 }
 
 interface SessionIndexEntry {
@@ -19,10 +21,14 @@ interface SessionIndexEntry {
   inputItems: unknown[];
   outputItems: unknown[];
   updatedAt: number;
+  bytes: number;
 }
 
 const seenSessionKeys = new Set<string>();
 const entriesByFirstItem = new Map<string, SessionIndexEntry[]>();
+// Insertion-ordered LRU over every stored entry; re-set on update.
+const entriesBySessionKey = new Map<string, SessionIndexEntry>();
+let totalTranscriptBytes = 0;
 
 export function touchSessionKey(sessionKey: string) {
   if (seenSessionKeys.has(sessionKey)) {
@@ -36,10 +42,6 @@ export function touchSessionKey(sessionKey: string) {
   if (oldest) seenSessionKeys.delete(oldest);
 }
 
-export function hasSessionKey(sessionKey: string): boolean {
-  return seenSessionKeys.has(sessionKey);
-}
-
 export function rememberPrefixSession(input: {
   ownerKey: string;
   sessionKey: string;
@@ -47,67 +49,33 @@ export function rememberPrefixSession(input: {
   outputItems: unknown[];
   updatedAt: number;
 }) {
-  const inputItems = boundedTranscriptItems(input.inputItems);
-  const outputItems = boundedTranscriptItems(input.outputItems);
-  if (!inputItems.length) return;
+  const bytes = transcriptBytes(input.inputItems, input.outputItems);
+  if (bytes > MAX_STORED_TRANSCRIPT_BYTES) return;
+  if (!input.inputItems.length) return;
+  dropSessionEntry(input.sessionKey);
   const entry: SessionIndexEntry = {
     ownerKey: input.ownerKey,
     sessionKey: input.sessionKey,
-    inputItems,
-    outputItems,
-    updatedAt: input.updatedAt
+    inputItems: input.inputItems,
+    outputItems: input.outputItems,
+    updatedAt: input.updatedAt,
+    bytes
   };
   const key = bucketKey(input.ownerKey, canonicalizeItem(entry.inputItems[0]));
   const bucket = entriesByFirstItem.get(key) ?? [];
-  const next = bucket.filter((candidate) => candidate.sessionKey !== entry.sessionKey);
-  next.push(entry);
-  entriesByFirstItem.set(key, next);
+  bucket.push(entry);
+  entriesByFirstItem.set(key, bucket);
+  entriesBySessionKey.set(entry.sessionKey, entry);
+  totalTranscriptBytes += bytes;
+  evictOverBudget();
 }
 
-/**
- * Current input relative to a stored Responses transcript.
- * Full prefix: client replayed input+output.
- * Input prefix: client replayed input and reattached stored function_calls.
- * No prefix: treat current as a delta (OpenAI previous_response_id contract).
- */
-export function matchTranscriptPrefix(
-  currentItems: unknown[],
-  storedInput: unknown[] = [],
-  storedOutput: unknown[] = []
-): TranscriptLeftover {
-  if (!currentItems.length) {
-    return { leftover: [], matched: storedInput.length + storedOutput.length > 0 };
-  }
-  const current = canonicalizeItems(currentItems);
-  const full = canonicalizeItems([...storedInput, ...storedOutput]);
-  const inputOnly = canonicalizeItems(storedInput);
-  if (full.length && isItemPrefix(full, current)) {
-    return { leftover: currentItems.slice(full.length), matched: true };
-  }
-  if (inputOnly.length && isItemPrefix(inputOnly, current)) {
-    const functionCalls = canonicalizeItems(storedOutput).filter(isFunctionCall);
-    const leftover = currentItems.slice(inputOnly.length).filter((item) => {
-      const canonical = canonicalizeItem(item);
-      return !functionCalls.some((call) => itemsEqual(canonical, call));
-    });
-    return { leftover, matched: true };
-  }
-  return { leftover: currentItems, matched: false };
-}
-
-export function leftoverAfterTranscript(
-  currentItems: unknown[],
-  storedInput: unknown[] = [],
-  storedOutput: unknown[] = []
-): unknown[] {
-  return matchTranscriptPrefix(currentItems, storedInput, storedOutput).leftover;
-}
-
-export function matchPrefixSession(ownerKey: string | undefined, currentItems: unknown[]): SessionPrefixMatch | undefined {
+export function matchPrefixSession(ownerKey: string | undefined, input: unknown): SessionPrefixMatch | undefined {
   if (!ownerKey) return undefined;
-  const current = canonicalizeItems(currentItems);
-  if (!current.length) return undefined;
-  const bucket = entriesByFirstItem.get(bucketKey(ownerKey, current[0])) ?? [];
+  const currentItems = responseInputItems(input);
+  if (!currentItems.length) return undefined;
+  const first = canonicalizeItem(currentItems[0]);
+  const bucket = entriesByFirstItem.get(bucketKey(ownerKey, first)) ?? [];
   let best: (SessionPrefixMatch & { updatedAt: number }) | undefined;
   for (const stored of bucket) {
     const match = matchTranscriptPrefix(currentItems, stored.inputItems, stored.outputItems);
@@ -115,7 +83,6 @@ export function matchPrefixSession(ownerKey: string | undefined, currentItems: u
     if (!best || stored.updatedAt > best.updatedAt) {
       best = {
         sessionKey: stored.sessionKey,
-        newInputItems: match.leftover,
         inputItems: stored.inputItems,
         outputItems: stored.outputItems,
         updatedAt: stored.updatedAt
@@ -125,15 +92,36 @@ export function matchPrefixSession(ownerKey: string | undefined, currentItems: u
   if (!best) return undefined;
   return {
     sessionKey: best.sessionKey,
-    newInputItems: best.newInputItems,
     inputItems: best.inputItems,
     outputItems: best.outputItems
+  };
+}
+
+/**
+ * Stored transcript for an exact session key (client-provided affinity such as
+ * a Responses prompt_cache_key). Returned only when the stored transcript is a
+ * prefix of the current input, so callers can safely treat leftover items as
+ * the delta.
+ */
+export function sessionTranscript(ownerKey: string, sessionKey: string, input: unknown): SessionPrefixMatch | undefined {
+  const stored = entriesBySessionKey.get(sessionKey);
+  if (!stored || stored.ownerKey !== ownerKey) return undefined;
+  const currentItems = responseInputItems(input);
+  if (!currentItems.length) return undefined;
+  const match = matchTranscriptPrefix(currentItems, stored.inputItems, stored.outputItems);
+  if (!match.matched) return undefined;
+  return {
+    sessionKey: stored.sessionKey,
+    inputItems: stored.inputItems,
+    outputItems: stored.outputItems
   };
 }
 
 export function resetSessionIndex() {
   seenSessionKeys.clear();
   entriesByFirstItem.clear();
+  entriesBySessionKey.clear();
+  totalTranscriptBytes = 0;
 }
 
 export function boundedTranscriptItems(items: unknown[]): unknown[] {
@@ -142,72 +130,34 @@ export function boundedTranscriptItems(items: unknown[]): unknown[] {
   return [];
 }
 
-function isItemPrefix(prefix: unknown[], current: unknown[]): boolean {
-  if (current.length < prefix.length) return false;
-  for (let index = 0; index < prefix.length; index += 1) {
-    if (!itemsEqual(prefix[index], current[index])) return false;
-  }
-  return true;
+function transcriptBytes(inputItems: unknown[], outputItems: unknown[]): number {
+  return Buffer.byteLength(JSON.stringify(inputItems)) + Buffer.byteLength(JSON.stringify(outputItems));
 }
 
-function canonicalizeItems(items: unknown[]): unknown[] {
-  return items.map(canonicalizeItem);
+function dropSessionEntry(sessionKey: string) {
+  const existing = entriesBySessionKey.get(sessionKey);
+  if (!existing) return;
+  entriesBySessionKey.delete(sessionKey);
+  totalTranscriptBytes -= existing.bytes;
+  const key = bucketKey(existing.ownerKey, canonicalizeItem(existing.inputItems[0]));
+  const bucket = entriesByFirstItem.get(key);
+  if (!bucket) return;
+  const next = bucket.filter((candidate) => candidate !== existing);
+  if (next.length) entriesByFirstItem.set(key, next);
+  else entriesByFirstItem.delete(key);
 }
 
-function canonicalizeItem(item: unknown): unknown {
-  if (typeof item === "string") return { type: "message", role: "user", text: item };
-  if (!isRecord(item)) return item;
-  const type = typeof item.type === "string" ? item.type : typeof item.role === "string" ? "message" : "unknown";
-  if (type === "input_text" && typeof item.text === "string") {
-    return { type: "message", role: "user", text: item.text };
+function evictOverBudget() {
+  while (totalTranscriptBytes > MAX_TOTAL_TRANSCRIPT_BYTES) {
+    const oldest = entriesBySessionKey.values().next().value;
+    if (!oldest) {
+      totalTranscriptBytes = 0;
+      return;
+    }
+    dropSessionEntry(oldest.sessionKey);
   }
-  if (type === "message" || typeof item.role === "string") {
-    return {
-      type: "message",
-      role: typeof item.role === "string" ? item.role : "user",
-      text: contentTextForPrefix(item.content)
-    };
-  }
-  if (type === "function_call") {
-    return {
-      type: "function_call",
-      call_id: typeof item.call_id === "string" ? item.call_id : "",
-      name: typeof item.name === "string" ? item.name : "",
-      arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {})
-    };
-  }
-  if (type === "function_call_output") {
-    return {
-      type: "function_call_output",
-      call_id: typeof item.call_id === "string" ? item.call_id : "",
-      output: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "")
-    };
-  }
-  return { type, value: item };
-}
-
-function isFunctionCall(item: unknown): boolean {
-  return isRecord(item) && item.type === "function_call";
-}
-
-function contentTextForPrefix(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return content == null ? "" : JSON.stringify(content);
-  return content.map((part) => {
-    if (typeof part === "string") return part;
-    if (isRecord(part) && typeof part.text === "string") return part.text;
-    return "";
-  }).join("");
 }
 
 function bucketKey(ownerKey: string, firstItem: unknown): string {
   return `${ownerKey}:${JSON.stringify(firstItem)}`;
-}
-
-function itemsEqual(left: unknown, right: unknown): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }

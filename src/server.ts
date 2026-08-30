@@ -16,7 +16,6 @@ import {
   responseTextStartEvents,
   responseToolCallEvents,
   toOpenAiToolCalls,
-  responsesInputItemsFromBody,
   cachedCharsFromIncremental,
   type OpenAiToolSpec,
   type PreparedRequest,
@@ -27,7 +26,7 @@ import { encodeSse } from "./sse.js";
 import { baseUrl, DISPLAY_NAME, resolveRequestApiKey, type AppConfig } from "./config.js";
 import { COMPOSER_MODELS, localModelList, modelById, modelObject, resolveCursorModel } from "./models.js";
 import { collectSdkOutput, runSdkStream, type SdkBridgeSettings } from "./sdk.js";
-import { boundedTranscriptItems, matchPrefixSession, rememberPrefixSession, resetSessionIndex, touchSessionKey } from "./session-index.js";
+import { boundedTranscriptItems, matchPrefixSession, rememberPrefixSession, resetSessionIndex, sessionTranscript, touchSessionKey } from "./session-index.js";
 import type { CursorTextEvent, CursorTokenUsage } from "./types.js";
 import { createHash } from "node:crypto";
 
@@ -176,11 +175,8 @@ async function routeRequest(request: Request, ctx: ServerContext): Promise<Respo
   const ownerKey = responseOwnerKey(apiKey);
   const previousState = previousResponseId ? getResponseState(ownerKey, previousResponseId) : undefined;
   if (previousResponseId && !previousState) throw new HttpError("Response not found", 404, "not_found");
-  const affinity = route.kind === "responses" ? sessionAffinity(request) : undefined;
-  const prefixMatch =
-    route.kind === "responses" && !previousState && !affinity
-      ? matchPrefixSession(ownerKey, responsesInputItemsFromBody(body))
-      : undefined;
+  const affinity = route.kind === "responses" ? sessionAffinity(request, body) : undefined;
+  const prior = priorTranscript(route.kind, body, previousState, affinity, ownerKey);
 
   const prepared =
     route.kind === "chat"
@@ -188,14 +184,13 @@ async function routeRequest(request: Request, ctx: ServerContext): Promise<Respo
         ? prepareOpencodeSdkChatRequest(body, cursorModel)
         : prepareChatRequest(body, cursorModel, { forceAgentMode: route.surface === "opencode" })
       : prepareResponsesRequest(body, cursorModel, {
-          previousOutput: previousState?.outputItems ?? prefixMatch?.outputItems,
-          previousInputItems: previousState?.inputItems ?? prefixMatch?.inputItems
+          previousOutput: prior?.outputItems,
+          previousInputItems: prior?.inputItems
         });
   const id = `${route.kind === "chat" ? "chatcmpl" : "resp"}_${idSuffix(ctx)}`;
   return handlePrepared(request, ctx, apiKey, route.kind, prepared, id, {
     ownerKey: route.kind === "responses" ? ownerKey : undefined,
-    previousState,
-    prefixSessionKey: prefixMatch?.sessionKey,
+    sessionKey: prior?.sessionKey,
     affinity
   });
 }
@@ -209,64 +204,61 @@ async function handlePrepared(
   id: string,
   state?: {
     ownerKey?: string;
-    previousState?: StoredResponseState;
-    prefixSessionKey?: string;
+    sessionKey?: string;
     affinity?: string;
   }
 ): Promise<Response> {
   const created = Math.floor(ctx.now().getTime() / 1000);
   const affinity = state?.affinity || (kind === "chat" ? sessionAffinity(request) : undefined);
   const sdkSessionKey =
-    state?.previousState?.sdkSessionKey
+    state?.sessionKey
     || affinity
-    || state?.prefixSessionKey
     || conversationSeed(prepared)
     || id;
   touchSessionKey(sdkSessionKey);
-  const ready = prepared;
 
-  if (ready.stream) {
-    return streamPrepared(kind, ready, request, ctx, apiKey, id, created, sdkSessionKey, state?.ownerKey);
+  if (prepared.stream) {
+    return streamPrepared(kind, prepared, request, ctx, apiKey, id, created, sdkSessionKey, state?.ownerKey);
   }
 
-  const output = await completePrepared(ready, request, ctx, apiKey, sdkSessionKey);
+  const output = await completePrepared(prepared, request, ctx, apiKey, sdkSessionKey);
   const toolCalls = toOpenAiToolCalls({
     toolCalls: output.toolCalls,
-    tools: ready.tools,
+    tools: prepared.tools,
     responseId: id,
-    context: ready.toolContext
+    context: prepared.toolContext
   });
   if (kind === "chat") {
     return json(
       chatCompletionResponse({
         id,
         created,
-        model: ready.model,
+        model: prepared.model,
         text: output.text,
         toolCalls,
-        promptChars: ready.promptChars,
-        cachedChars: cachedCharsFromIncremental(ready.promptChars, ready.incrementalPrompt),
+        promptChars: prepared.promptChars,
+        cachedChars: cachedCharsFromIncremental(prepared.promptChars, prepared.incrementalPrompt),
         reportedUsage: output.usage,
-        metadata: ready.responseMetadata
+        metadata: prepared.responseMetadata
       })
     );
   }
   const response = responseObject({
     id,
     created,
-    model: ready.model,
+    model: prepared.model,
     text: output.text,
     toolCalls,
-    promptChars: ready.promptChars,
-    cachedChars: cachedCharsFromIncremental(ready.promptChars, ready.incrementalPrompt),
+    promptChars: prepared.promptChars,
+    cachedChars: cachedCharsFromIncremental(prepared.promptChars, prepared.incrementalPrompt),
     reportedUsage: output.usage,
-    metadata: ready.responseMetadata
+    metadata: prepared.responseMetadata
   });
   if (state?.ownerKey) {
     storeResponseState(state.ownerKey, {
       id,
       response,
-      inputItems: ready.responseInputItems ?? [],
+      inputItems: prepared.responseInputItems ?? [],
       outputItems: (response.output as unknown[]) ?? [],
       store: prepared.storeResponse !== false,
       sdkSessionKey,
@@ -630,12 +622,61 @@ function healthObject(ctx: ServerContext): Record<string, unknown> {
   };
 }
 
-function sessionAffinity(request: Request): string | undefined {
-  return (
+interface PriorTranscript {
+  inputItems: unknown[];
+  outputItems: unknown[];
+  sessionKey?: string;
+}
+
+function priorTranscript(
+  kind: ApiKind,
+  body: unknown,
+  previousState: StoredResponseState | undefined,
+  affinity: string | undefined,
+  ownerKey: string
+): PriorTranscript | undefined {
+  if (kind !== "responses") return undefined;
+  if (previousState) {
+    return {
+      inputItems: previousState.inputItems,
+      outputItems: previousState.outputItems,
+      sessionKey: previousState.sdkSessionKey
+    };
+  }
+  if (affinity) {
+    // Affinity pins the sdk session; the stored transcript for that session
+    // still supplies the prefix so the bridge can send an incremental prompt
+    // instead of evicting the warm (cached) Cursor agent.
+    const stored = sessionTranscript(ownerKey, affinity, isRecord(body) ? body.input : undefined);
+    if (!stored) return undefined;
+    return {
+      inputItems: stored.inputItems,
+      outputItems: stored.outputItems,
+      sessionKey: affinity
+    };
+  }
+  const match = matchPrefixSession(ownerKey, isRecord(body) ? body.input : undefined);
+  if (!match) return undefined;
+  return {
+    inputItems: match.inputItems,
+    outputItems: match.outputItems,
+    sessionKey: match.sessionKey
+  };
+}
+
+function sessionAffinity(request: Request, body?: unknown): string | undefined {
+  const header = (
     request.headers.get("x-session-affinity") ||
     request.headers.get("x-opencode-session-id") ||
     request.headers.get("x-opencode-session")
-  )?.trim() || undefined;
+  )?.trim();
+  if (header) return header;
+  // OpenAI Responses/Chat clients (rho, codex) send a stable per-conversation
+  // prompt_cache_key; reuse it as sdk session affinity for prompt caching.
+  if (isRecord(body) && typeof body.prompt_cache_key === "string" && body.prompt_cache_key.trim()) {
+    return `pck_${body.prompt_cache_key.trim()}`;
+  }
+  return undefined;
 }
 
 function conversationSeed(prepared: PreparedRequest): string | undefined {
@@ -672,7 +713,10 @@ function storeResponseState(
     now: number;
   }
 ) {
-  const storedInputItems = input.store ? boundedTranscriptItems(input.inputItems) : [];
+  // Transcript memory drives sdk session affinity and prompt caching; it is
+  // internal to this server, so it stays on even for store:false clients
+  // (rho always sends store:false). Only response retrieval honors store.
+  const storedInputItems = boundedTranscriptItems(input.inputItems);
   const storedOutputItems = boundedTranscriptItems(input.outputItems);
   responseState.set(responseStateKey(ownerKey, input.id), {
     ownerKey,

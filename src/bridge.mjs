@@ -308,14 +308,20 @@ async function runLocalAgentBody(input, onRun, onEvent) {
 async function startFreshLocalAgentRun(input, onRun, onEvent) {
   const runToken = crypto.randomUUID();
   let agentEntry = await getAgent(input);
-  const reuseCache = Boolean(
-    agentEntry.cached && hasDistinctIncrementalPrompt(input.prompt, input.incrementalPrompt)
-  );
+  // Prefer the caller's delta; otherwise derive one from the transcript the
+  // cached agent has already ingested. Evicting on a missing delta destroyed
+  // the warm Cursor agent (and its server-side prompt cache) every time the
+  // upstream prefix matcher missed, forcing a full uncached re-send.
+  const incrementalPrompt = hasDistinctIncrementalPrompt(input.prompt, input.incrementalPrompt)
+    ? input.incrementalPrompt
+    : derivedIncrementalPrompt(agentEntry, input.prompt);
+  const reuseCache = Boolean(agentEntry.cached && incrementalPrompt);
   if (agentEntry.cached && !reuseCache) {
     evictAgent(agentEntry.cacheKey, agentEntry.agent);
     agentEntry = await getAgent(input);
   }
-  const prompt = reuseCache ? input.incrementalPrompt : input.prompt;
+  const prompt = reuseCache ? incrementalPrompt : input.prompt;
+  rememberAgentPrompt(agentEntry.cacheKey, input.prompt);
   const pending = pendingRuntime.beginPendingRun(input, agentEntry, runToken);
   const sendInput = { ...input, runToken, mcpToken: agentEntry.mcpToken };
   try {
@@ -365,9 +371,28 @@ function evictAgent(cacheKey, agent) {
   if (cached?.agent === agent) {
     agentCache.delete(cacheKey);
   }
+  agentFullPrompts.delete(cacheKey);
   try {
     agent.close();
   } catch {}
+}
+
+// Last full client-view prompt per cached agent. When the upstream server
+// cannot provide incrementalPrompt but the new full prompt extends the last
+// one, the suffix is a valid delta for the warm agent.
+const agentFullPrompts = new Map();
+
+function rememberAgentPrompt(cacheKey, fullPrompt) {
+  if (typeof fullPrompt === "string" && fullPrompt) agentFullPrompts.set(cacheKey, fullPrompt);
+}
+
+function derivedIncrementalPrompt(agentEntry, fullPrompt) {
+  if (!agentEntry.cached || typeof fullPrompt !== "string") return undefined;
+  const previous = agentFullPrompts.get(agentEntry.cacheKey);
+  if (!previous || fullPrompt.length <= previous.length) return undefined;
+  if (!fullPrompt.startsWith(previous)) return undefined;
+  const suffix = fullPrompt.slice(previous.length).replace(/^\n+/, "");
+  return suffix.trim() ? suffix : undefined;
 }
 
 function evictCachedAgent(input) {
@@ -2219,6 +2244,7 @@ function _resetBridgeStateForTests() {
   pendingRuntime.reset();
   agentCache.clear();
   agentRunQueues.clear();
+  agentFullPrompts.clear();
   createAgentImpl = defaultCreateAgent;
 }
 

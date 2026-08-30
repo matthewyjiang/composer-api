@@ -74,14 +74,99 @@ describe("Cursor SDK local-agent bridge", () => {
     await runLocalAgent({
       ...base,
       prompt: "full transcript turn 1\nand turn 2",
-      incrementalPrompt: "Continue from this new input only:\n\nand turn 2",
+      incrementalPrompt: "and turn 2",
       requestId: "req-2"
     });
     expect(creates).toBe(1);
     expect(prompts).toEqual([
       "full transcript turn 1",
-      "Continue from this new input only:\n\nand turn 2"
+      "and turn 2"
     ]);
+    _resetBridgeStateForTests();
+  });
+
+  it("derives an incremental prompt for a cached agent when the server sends none", async () => {
+    _resetBridgeStateForTests();
+    let creates = 0;
+    const prompts = [];
+    _setCreateAgentForTests(async () => {
+      creates += 1;
+      return {
+        agentId: `agent-${creates}`,
+        close() {},
+        async send(prompt) {
+          prompts.push(prompt);
+          return {
+            id: `run-${prompts.length}`,
+            async *stream() {
+              yield { type: "assistant", message: { content: [{ type: "text", text: "ok" }] } };
+            },
+            async wait() {
+              return { status: "finished", result: "ok" };
+            },
+            async cancel() {}
+          };
+        }
+      };
+    });
+    const base = {
+      apiKey: "test-key",
+      model: "composer-2.5",
+      sessionKey: "derive-session",
+      workingDirectory: "/tmp/project",
+      clientTools: []
+    };
+    await runLocalAgent({ ...base, prompt: "full transcript turn 1", requestId: "req-1" });
+    // No incrementalPrompt from the server, but the full prompt extends the
+    // previous one: the bridge must not evict the warm agent.
+    await runLocalAgent({
+      ...base,
+      prompt: "full transcript turn 1\nUSER: turn 2 delta",
+      requestId: "req-2"
+    });
+    expect(creates).toBe(1);
+    expect(prompts).toEqual([
+      "full transcript turn 1",
+      "USER: turn 2 delta"
+    ]);
+    _resetBridgeStateForTests();
+  });
+
+  it("still recreates the agent when the new prompt does not extend the old one", async () => {
+    _resetBridgeStateForTests();
+    let creates = 0;
+    const prompts = [];
+    _setCreateAgentForTests(async () => {
+      creates += 1;
+      return {
+        agentId: `agent-${creates}`,
+        close() {},
+        async send(prompt) {
+          prompts.push(prompt);
+          return {
+            id: `run-${prompts.length}`,
+            async *stream() {
+              yield { type: "assistant", message: { content: [{ type: "text", text: "ok" }] } };
+            },
+            async wait() {
+              return { status: "finished", result: "ok" };
+            },
+            async cancel() {}
+          };
+        }
+      };
+    });
+    const base = {
+      apiKey: "test-key",
+      model: "composer-2.5",
+      sessionKey: "rewrite-session",
+      workingDirectory: "/tmp/project",
+      clientTools: []
+    };
+    await runLocalAgent({ ...base, prompt: "history shape A", requestId: "req-1" });
+    await runLocalAgent({ ...base, prompt: "totally different history B", requestId: "req-2" });
+    expect(creates).toBe(2);
+    expect(prompts).toEqual(["history shape A", "totally different history B"]);
     _resetBridgeStateForTests();
   });
 

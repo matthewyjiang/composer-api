@@ -503,6 +503,110 @@ describe("local OpenAI server", () => {
     expect(calls[1].incrementalPrompt).not.toContain("unique prefix incremental zzz");
   });
 
+  it("keeps session continuity for store:false clients (rho sends store:false)", async () => {
+    _resetResponseStateForTests();
+    const calls: Array<{ incrementalPrompt?: string; sessionKey: string }> = [];
+    const ctx = createContext(config(), { url: "http://127.0.0.1:8792/sdk", token: "bridge" }, {
+      now: () => new Date("2026-08-12T00:00:00Z"),
+      randomUUID: () => "00000000-0000-4000-8000-00000000000" + String(calls.length + 1),
+      runSdk: async function* (_settings, input) {
+        calls.push({ incrementalPrompt: input.incrementalPrompt, sessionKey: input.sessionKey });
+        yield { type: "text", text: "ok" };
+        yield { type: "done", finalText: "ok", toolCalls: [] };
+      }
+    });
+    const user = (text: string) => ({ type: "message", role: "user", content: [{ type: "input_text", text }] });
+    const turn1 = [user("store false continuity zzz")];
+    await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({ model: "composer-2.5", input: turn1, store: false })
+      }),
+      ctx
+    );
+    await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({ model: "composer-2.5", input: [...turn1, user("second turn delta")], store: false })
+      }),
+      ctx
+    );
+    expect(calls).toHaveLength(2);
+    expect(calls[0].sessionKey).toBe(calls[1].sessionKey);
+    expect(calls[1].incrementalPrompt).toContain("second turn delta");
+    expect(calls[1].incrementalPrompt).not.toContain("store false continuity zzz");
+  });
+
+  it("uses body prompt_cache_key as session affinity and still sends deltas", async () => {
+    _resetResponseStateForTests();
+    const calls: Array<{ incrementalPrompt?: string; sessionKey: string }> = [];
+    const ctx = createContext(config(), { url: "http://127.0.0.1:8792/sdk", token: "bridge" }, {
+      now: () => new Date("2026-08-12T00:00:00Z"),
+      randomUUID: () => "00000000-0000-4000-8000-00000000000" + String(calls.length + 1),
+      runSdk: async function* (_settings, input) {
+        calls.push({ incrementalPrompt: input.incrementalPrompt, sessionKey: input.sessionKey });
+        yield { type: "text", text: "ok" };
+        yield { type: "done", finalText: "ok", toolCalls: [] };
+      }
+    });
+    const user = (text: string) => ({ type: "message", role: "user", content: [{ type: "input_text", text }] });
+    const turn1 = [user("cache key affinity turn one")];
+    for (const input of [turn1, [...turn1, user("cache key affinity turn two")]]) {
+      await handleRequest(
+        new Request("http://127.0.0.1:8787/v1/responses", {
+          method: "POST",
+          headers: { authorization: "Bearer local", "content-type": "application/json" },
+          body: JSON.stringify({ model: "composer-2.5", input, store: false, prompt_cache_key: "rho:session-1" })
+        }),
+        ctx
+      );
+    }
+    expect(calls).toHaveLength(2);
+    expect(calls[0].sessionKey).toBe("pck_rho:session-1");
+    expect(calls[1].sessionKey).toBe("pck_rho:session-1");
+    expect(calls[1].incrementalPrompt).toContain("cache key affinity turn two");
+    expect(calls[1].incrementalPrompt).not.toContain("cache key affinity turn one");
+  });
+
+  it("keeps prefix continuity for transcripts larger than 256 KiB", async () => {
+    _resetResponseStateForTests();
+    const calls: Array<{ incrementalPrompt?: string; sessionKey: string }> = [];
+    const ctx = createContext(config(), { url: "http://127.0.0.1:8792/sdk", token: "bridge" }, {
+      now: () => new Date("2026-08-12T00:00:00Z"),
+      randomUUID: () => "00000000-0000-4000-8000-00000000000" + String(calls.length + 1),
+      runSdk: async function* (_settings, input) {
+        calls.push({ incrementalPrompt: input.incrementalPrompt, sessionKey: input.sessionKey });
+        yield { type: "text", text: "ok" };
+        yield { type: "done", finalText: "ok", toolCalls: [] };
+      }
+    });
+    const user = (text: string) => ({ type: "message", role: "user", content: [{ type: "input_text", text }] });
+    const bigText = `large transcript marker ${"x".repeat(400 * 1024)}`;
+    const turn1 = [user(bigText)];
+    await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({ model: "composer-2.5", input: turn1, store: false })
+      }),
+      ctx
+    );
+    await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({ model: "composer-2.5", input: [...turn1, user("big delta turn")], store: false })
+      }),
+      ctx
+    );
+    expect(calls).toHaveLength(2);
+    expect(calls[0].sessionKey).toBe(calls[1].sessionKey);
+    expect(calls[1].incrementalPrompt).toContain("big delta turn");
+    expect(calls[1].incrementalPrompt?.length ?? 0).toBeLessThan(10_000);
+  });
+
   it("reuses a conversation session key across Responses turns without previous_response_id", async () => {
     _resetResponseStateForTests();
     const keys: string[] = [];
