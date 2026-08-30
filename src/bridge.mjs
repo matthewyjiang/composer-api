@@ -273,15 +273,14 @@ async function runLocalAgentBody(input, onRun, onEvent) {
   const capturedToolCalls = [];
   const capturedToolCallKeys = new Set();
   let cancelRequested = false;
-  let cancelScheduled = false;
+  let cancelTimer = null;
   let text = "";
 
   const scheduleCancel = () => {
-    if (cancelScheduled) return;
-    cancelScheduled = true;
-    // Same-turn sibling tool-call-started events run before this. Then we
-    // cancel so Cursor does not continue on dummy MCP results.
-    setImmediate(() => {
+    if (cancelTimer) clearImmediate(cancelTimer);
+    // Quiet for one event-loop turn after the latest capture, then cancel.
+    // Resetting on each capture keeps a same-turn parallel burst together.
+    cancelTimer = setImmediate(() => {
       cancelRequested = true;
       run?.cancel().catch(() => {});
     });
@@ -332,15 +331,13 @@ async function runLocalAgentBody(input, onRun, onEvent) {
     });
     onRun(run);
 
-    // Same-turn sibling tool-call-started events are already queued. Do not
-    // drain run.stream() after cancel; that iterator does not end, so Rho
-    // never got response.completed.
-    if (capturedToolCalls.length) {
-      await new Promise((resolve) => setImmediate(resolve));
-      run.cancel().catch(() => {});
-    } else {
+    // Cancel is deferred one event-loop turn after the latest capture so a
+    // parallel onDelta burst is collected. Do not drain run.stream() after
+    // that; the canceled iterator does not end.
+    if (!capturedToolCalls.length) {
       for await (const event of run.stream()) {
         if (event.type === "assistant") {
+          if (capturedToolCalls.length) break;
           for (const block of event.message?.content ?? []) {
             if (block?.type === "text" && typeof block.text === "string") {
               text += block.text;
@@ -352,12 +349,13 @@ async function runLocalAgentBody(input, onRun, onEvent) {
         if (event.type === "tool_call") {
           if (event.status && event.status !== "running") continue;
           await captureToolCall({ type: event.name, args: event.args });
-          if (capturedToolCalls.length) {
-            run.cancel().catch(() => {});
-            break;
-          }
         }
       }
+    }
+    if (capturedToolCalls.length) {
+      await new Promise((resolve) => setImmediate(resolve));
+      cancelRequested = true;
+      run.cancel().catch(() => {});
     }
   } catch (error) {
     if (!capturedToolCalls.length && !(cancelRequested && isBenignCancellationError(error))) {
