@@ -121,6 +121,11 @@ export function createPendingRunRuntime({
 
   async function attachConsumerAndWait(pending, onEvent) {
     pending.turnParked = [];
+    // Each attach serves one client turn. Reset the text accumulator so the
+    // final turn's result does not include prose from earlier tool-call turns
+    // (which the client already received), otherwise consumers that diff
+    // streamed text against result text emit a duplicated tail.
+    pending.text = "";
     pending.consumer = { emit: onEvent };
     for (const event of pending.buffered) {
       if (event.type === "text") {

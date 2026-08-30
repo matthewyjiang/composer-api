@@ -146,6 +146,43 @@ describe("runSdkStream", () => {
     expect(events.at(-1)).toMatchObject({ type: "done", finalText: "ok" });
   });
 
+  it("does not re-emit a tail when done output text is not an extension of the streamed text", async () => {
+    // Regression: multi-turn bridge runs used to report output.text containing
+    // earlier turns' prose. Slicing by length alone re-emitted the end of the
+    // current turn as a duplicate delta.
+    globalThis.fetch = async () =>
+      new Response(
+        ndjsonStream([
+          JSON.stringify({ type: "text", text: "current turn answer" }),
+          JSON.stringify({ type: "done", output: { text: "earlier turn prose current turn answer", toolCalls: [] } })
+        ]),
+        { status: 200 }
+      );
+    const events = [];
+    for await (const event of runSdkStream(settings, input())) events.push(event);
+    const textEvents = events.filter((event) => event.type === "text");
+    expect(textEvents).toEqual([{ type: "text", text: "current turn answer" }]);
+    expect(events.at(-1)).toMatchObject({ type: "done", finalText: "earlier turn prose current turn answer" });
+  });
+
+  it("still emits the unstreamed remainder when done output extends the streamed text", async () => {
+    globalThis.fetch = async () =>
+      new Response(
+        ndjsonStream([
+          JSON.stringify({ type: "text", text: "partial " }),
+          JSON.stringify({ type: "done", output: { text: "partial answer", toolCalls: [] } })
+        ]),
+        { status: 200 }
+      );
+    const events = [];
+    for await (const event of runSdkStream(settings, input())) events.push(event);
+    const textEvents = events.filter((event) => event.type === "text");
+    expect(textEvents).toEqual([
+      { type: "text", text: "partial " },
+      { type: "text", text: "answer" }
+    ]);
+  });
+
   it("forwards Cursor token usage from the done output", async () => {
     const usage = {
       inputTokens: 12,

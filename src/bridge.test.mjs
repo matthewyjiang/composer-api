@@ -2315,6 +2315,87 @@ describe("Cursor SDK local-agent bridge", () => {
     _resetBridgeStateForTests();
   });
 
+  it("does not repeat prior-turn prose in the resumed turn's final text", async () => {
+    // Regression: pending.text accumulated across park/resume turns, so the
+    // final turn's result text included turn-1 prose the client already got,
+    // which downstream diffing re-emitted as a duplicated tail.
+    const clientTools = [
+      {
+        name: "grep",
+        parameters: {
+          type: "object",
+          properties: { pattern: { type: "string" } },
+          required: ["pattern"]
+        }
+      }
+    ];
+    let runToken = "";
+    let releaseStream;
+    let sent;
+    const sentP = new Promise((resolve) => {
+      sent = resolve;
+    });
+    const streamGate = new Promise((resolve) => {
+      releaseStream = resolve;
+    });
+    _setCreateAgentForTests(async () => ({
+      agentId: "agent-1",
+      close() {},
+      async send(_prompt, options) {
+        runToken = options.mcpServers.client.env.CURSOR_SDK_BRIDGE_RUN_TOKEN;
+        sent();
+        return {
+          id: "run-1",
+          async *stream() {
+            yield { type: "assistant", message: { content: [{ type: "text", text: "turn one prose. " }] } };
+            await streamGate;
+            yield { type: "assistant", message: { content: [{ type: "text", text: "turn two answer" }] } };
+          },
+          async wait() {
+            return { status: "finished", result: "turn two answer" };
+          },
+          async cancel() {}
+        };
+      }
+    }));
+
+    const input = {
+      apiKey: "test-key",
+      model: "composer-2.5",
+      prompt: "search once",
+      sessionKey: "dup-session",
+      workingDirectory: "/tmp/project",
+      requestId: "req-1",
+      clientTools
+    };
+    const firstEvents = [];
+    const first = runLocalAgent(input, (event) => firstEvents.push(event));
+    await sentP;
+    const park = parkedHttp();
+    ingestClientToolCall({
+      runToken,
+      callId: "call_dup",
+      toolName: "grep",
+      arguments: { pattern: "foo" }
+    }, park.response);
+    const firstOutput = await first;
+    expect(firstOutput.status).toBe("tool_call");
+    expect(firstEvents.filter((event) => event.type === "text").map((event) => event.text)).toEqual(["turn one prose. "]);
+
+    const secondEvents = [];
+    const resumed = runLocalAgent({
+      ...input,
+      requestId: "req-2",
+      toolResults: [{ call_id: "call_dup", output: "foo hits" }]
+    }, (event) => secondEvents.push(event));
+    await park.body;
+    releaseStream();
+    const secondOutput = await resumed;
+    expect(secondOutput.text).toBe("turn two answer");
+    expect(secondEvents.filter((event) => event.type === "text").map((event) => event.text)).toEqual(["turn two answer"]);
+    _resetBridgeStateForTests();
+  });
+
   it("fails a parked call on timeout without awaiting a canceled stream", async () => {
     _setParkedCallTimeoutMsForTests(40);
     const clientTools = [

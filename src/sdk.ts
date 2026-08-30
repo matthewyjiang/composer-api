@@ -193,7 +193,10 @@ async function* runSdkBridgeOnce(
       const output = event.output as SdkRunOutput;
       const outputText = typeof output.text === "string" ? output.text : text;
       const outputToolCalls = Array.isArray(output.toolCalls) ? output.toolCalls : toolCalls;
-      if (outputText && outputText.length > text.length) {
+      if (outputText && outputText.length > text.length && outputText.startsWith(text)) {
+        // Emit only the genuinely unstreamed remainder. Guard with startsWith:
+        // slicing by length alone re-emits a tail chunk whenever outputText is
+        // not an extension of the streamed text (seen as duplicated endings).
         yield { type: "text", text: outputText.slice(text.length) };
       } else if (!text && outputText) {
         yield { type: "text", text: outputText };
