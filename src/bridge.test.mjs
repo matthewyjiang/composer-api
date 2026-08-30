@@ -1902,6 +1902,9 @@ describe("Cursor SDK local-agent bridge", () => {
     expect(createOptions.local).toEqual({
       cwd: "/tmp/project"
     });
+    // Builtins (shell, edit, ...) must stay off: they would run server-side
+    // without surfacing as client function_calls. Only the MCP family stays.
+    expect(createOptions.tools).toEqual(["mcp"]);
     expect(createOptions.model).toEqual({ id: "composer-2.5", params: [{ id: "fast", value: "false" }] });
     expect(createOptions).not.toHaveProperty("mcpServers");
     expect(createOptions.local).not.toHaveProperty("sandboxOptions");

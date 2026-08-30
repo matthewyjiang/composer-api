@@ -634,9 +634,12 @@ function localAgentCreateOptions(input) {
     name: "API for Cursor local bridge",
     local: {
       cwd: input.workingDirectory
-      // sandboxOptions in @cursor/sdk 1.0.13 is only { enabled }. It cannot
-      // disable Cursor builtins; we never emit those as client function_calls.
-    }
+    },
+    // Only the MCP tool family stays on: client tools forward through our MCP
+    // server, and with no client tools configured the model is text-only.
+    // Cursor builtins (shell, edit, ...) would execute server-side without ever
+    // surfacing as OpenAI function_calls, mutating the workspace invisibly.
+    tools: ["mcp"]
   };
 }
 
