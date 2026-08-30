@@ -1,43 +1,38 @@
 # API for Cursor
 
-Local OpenAI-compatible `chat.completions` and `responses` endpoints backed by Cursor models (Composer 2.5, Grok 4.6, and more).
+Run Cursor models (Composer 2.5, Grok 4.6, and more) through a local OpenAI-compatible API.
 
-This is a Linux CLI. It starts a localhost `/v1` server, reads your Cursor API key from the environment or a config file, and runs the Cursor SDK on the same machine.
+It starts a small server on your machine at `http://127.0.0.1:8787/v1`. Any tool that speaks the OpenAI API can point at that URL and use your Cursor subscription.
 
-## Install
+## Quick start
 
-```bash
-npm install
-npm run build
-```
-
-Node 22.6 or newer is required.
-
-## Configure
-
-A Cursor user API key comes from the Cursor Dashboard under Integrations.
+You need [Bun](https://bun.sh) (or Node 22.6+, see below) and a Cursor API key from the Cursor Dashboard under Integrations.
 
 ```bash
-export CURSOR_API_KEY="your-cursor-key"
-# or
-node dist/cli.js set-key your-cursor-key
+# 1. Get the code and its dependencies
+git clone https://github.com/standardagents/composer-api.git
+cd composer-api
+bun install
+
+# 2. Save your Cursor API key (stored in ~/.config/api-for-cursor/config.json)
+bun src/cli.ts set-key your-cursor-key
+
+# 3. Start the server
+bun src/cli.ts serve
 ```
 
-`set-key` writes `~/.config/api-for-cursor/config.json`.
+That's it. The API is now running at `http://127.0.0.1:8787/v1`.
 
-## Start the local API
+## Use it
+
+Point any OpenAI-compatible client at the local URL. The API key on the client side can be anything (like `local`) — the server uses your stored Cursor key.
 
 ```bash
-node dist/cli.js serve
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer local" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"composer-2.5","messages":[{"role":"user","content":"Hello"}]}'
 ```
-
-The default base URL is:
-
-```txt
-http://127.0.0.1:8787/v1
-```
-
-Point any OpenAI-compatible client at that URL. The client bearer token can be any placeholder such as `local`; the server uses the stored Cursor key.
 
 ```ts
 import OpenAI from "openai";
@@ -53,32 +48,39 @@ const completion = await client.chat.completions.create({
 });
 ```
 
+To set up a coding agent (opencode, codex, vscode, cline, kilo, or pi) to use the local server automatically:
+
 ```bash
-curl http://127.0.0.1:8787/v1/chat/completions \
-  -H "Authorization: Bearer local" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"composer-2.5","messages":[{"role":"user","content":"Hello"}]}'
+bun src/cli.ts setup          # configure all of them
+bun src/cli.ts setup opencode # or just one
 ```
 
 ## Commands
 
 ```bash
-cursor-api serve [--host 127.0.0.1] [--port 8787] [--key KEY]
-cursor-api set-key <cursor-api-key>
-cursor-api setup [opencode|codex|vscode|cline|kilo|pi|all]
-cursor-api models
+bun src/cli.ts serve [--host 127.0.0.1] [--port 8787] [--key KEY]
+bun src/cli.ts set-key <cursor-api-key>
+bun src/cli.ts setup [opencode|codex|vscode|cline|kilo|pi|all]
+bun src/cli.ts models
 ```
 
-`setup` writes local provider config for coding agents so they point at `http://127.0.0.1:8787/v1`.
+Instead of `set-key`, you can also set the key in your environment:
 
-## Supported endpoints
+```bash
+export CURSOR_API_KEY="your-cursor-key"
+```
 
-- `POST /v1/chat/completions`
-- `POST /v1/responses`
-- `GET /v1/models`
-- `POST /v1/completions`
-- `POST /v1/responses/input_tokens`
-- `POST /v1/responses/compact`
+## Using Node instead of Bun
+
+Node needs a build step first (Node 22.6 or newer):
+
+```bash
+npm install
+npm run build
+node dist/cli.js serve
+```
+
+Every `bun src/cli.ts <command>` above works as `node dist/cli.js <command>`.
 
 ## Models
 
@@ -89,25 +91,32 @@ cursor-api models
 - `grok-4.5`
 - `grok-4.5-fast`
 
+## Supported endpoints
+
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
+- `GET /v1/models`
+- `POST /v1/completions`
+- `POST /v1/responses/input_tokens`
+- `POST /v1/responses/compact`
+
 ## Compatibility notes
 
-This project supports text and image input, non-streaming and streaming output, JSON-output prompt constraints, and the common SDK response shapes. Image inputs can be sent as Chat Completions `image_url` parts or Responses `input_image` parts; each resolved image must be 1MB or smaller.
+This project supports text and image input, non-streaming and streaming output, JSON-output prompt constraints, tool calls, and the common SDK response shapes. Image inputs can be sent as Chat Completions `image_url` parts or Responses `input_image` parts.
 
 These OpenAI features are rejected because Cursor does not expose equivalent controls through this path:
 
 - `n` greater than `1`
 - `logprobs` and `top_logprobs`
 - audio output
-- OpenAI function/tool calls on the Responses API
 - background Responses API jobs
 
-Token usage is estimated from character counts because Cursor's stream does not return OpenAI token accounting on this path. For Composer 2.5 and the listed Grok models, `usage.cost` is estimated from Cursor's published per-million-token pricing.
+Token usage is estimated from character counts because Cursor's stream does not return OpenAI token accounting on this path. For all listed models, `usage.cost` is estimated from Cursor's published per-million-token pricing.
 
 ## Development
 
 ```bash
-npm install
-npm run test
-npm run typecheck
-npm run build
+bun install
+bun run test
+bun run typecheck
 ```
