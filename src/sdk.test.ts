@@ -1,0 +1,68 @@
+import { afterEach, describe, expect, it } from "vitest";
+import { runSdkStream, type SdkRunInput } from "./sdk.js";
+
+const encoder = new TextEncoder();
+const settings = { url: "http://127.0.0.1:8792/sdk", token: "bridge" };
+const originalFetch = globalThis.fetch;
+
+function input(overrides: Partial<SdkRunInput> = {}): SdkRunInput {
+  return {
+    apiKey: "cursor-key",
+    model: "composer-2.5",
+    prompt: "hello",
+    sessionKey: "session",
+    runId: "run-1",
+    tools: [{ name: "read_file", parameters: { type: "object", properties: { path: { type: "string" } } } }],
+    requiresLocalTool: false,
+    ...overrides
+  };
+}
+
+function ndjsonStream(lines: string[], hold?: Promise<void>): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    async start(controller) {
+      for (const line of lines) {
+        controller.enqueue(encoder.encode(`${line}\n`));
+      }
+      if (hold) await hold;
+      controller.close();
+    }
+  });
+}
+
+describe("runSdkStream", () => {
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("forwards tool-bearing text before the bridge run finishes", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    globalThis.fetch = async () =>
+      new Response(ndjsonStream([JSON.stringify({ type: "text", text: "partial" })], hold), { status: 200 });
+
+    const iterator = runSdkStream(settings, input())[Symbol.asyncIterator]();
+    const first = await iterator.next();
+    expect(first).toEqual({ done: false, value: { type: "text", text: "partial" } });
+    release();
+    await iterator.next();
+  });
+
+  it("omits incrementalPrompt when it matches the full prompt", async () => {
+    let body: Record<string, unknown> | undefined;
+    globalThis.fetch = async (_url, init) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(ndjsonStream([JSON.stringify({ type: "done", output: { text: "ok", toolCalls: [] } })]), {
+        status: 200
+      });
+    };
+
+    const events = [];
+    for await (const event of runSdkStream(settings, input())) events.push(event);
+    expect(body?.prompt).toBe("hello");
+    expect(body?.incrementalPrompt).toBeUndefined();
+    expect(events.at(-1)).toMatchObject({ type: "done", finalText: "ok" });
+  });
+});

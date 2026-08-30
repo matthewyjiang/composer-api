@@ -166,4 +166,44 @@ describe("local OpenAI server", () => {
     expect(new Set(completedCallIds).size).toBe(completedCallIds.length);
     expect(completedIds).toEqual(streamedIds);
   });
+
+  it("emits response.failed when the SDK stream throws", async () => {
+    async function* run(): AsyncGenerator<CursorTextEvent> {
+      throw new Error("Request body too large");
+    }
+    const ctx = context(run);
+    const response = await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          stream: true,
+          input: "hello"
+        })
+      }),
+      ctx
+    );
+    expect(response.status).toBe(200);
+
+    const types: string[] = [];
+    let failedMessage = "";
+    for await (const event of parseSse(response.body)) {
+      if (!event.data || event.data === "[DONE]") continue;
+      const payload = JSON.parse(event.data) as {
+        type?: string;
+        error?: { message?: string };
+        response?: { error?: { message?: string } };
+      };
+      if (payload.type) types.push(payload.type);
+      if (payload.type === "response.failed") {
+        failedMessage = payload.response?.error?.message || "";
+      }
+    }
+    expect(types).toContain("response.created");
+    expect(types).toContain("response.in_progress");
+    expect(types).toContain("response.failed");
+    expect(types).not.toContain("response.completed");
+    expect(failedMessage).toBe("Request body too large");
+  });
 });

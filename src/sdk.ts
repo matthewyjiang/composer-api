@@ -39,33 +39,61 @@ export async function* runSdkStream(
   settings: SdkBridgeSettings,
   input: SdkRunInput
 ): AsyncGenerator<CursorTextEvent> {
-  const shouldRetry = input.requiresLocalTool || input.tools.length > 0;
-  if (!shouldRetry) {
-    yield* runSdkBridgeOnce(settings, input);
-    return;
-  }
-
   let attemptInput = input;
-  let lastEvents: CursorTextEvent[] = [];
   for (let attempt = 1; attempt <= TOOL_RETRY_ATTEMPTS; attempt += 1) {
-    const events: CursorTextEvent[] = [];
+    // Hold output only when a workspace mutation is required and we can still
+    // retry a prose-only answer. Buffering every tool-bearing run (Rho's
+    // default) left Responses SSE idle after response.created until the whole
+    // Cursor turn finished, then closed empty if the bridge threw.
+    const holdForRetry = input.requiresLocalTool && attempt < TOOL_RETRY_ATTEMPTS;
+    const buffered: CursorTextEvent[] = [];
     let sawToolCall = false;
+    let sawText = false;
     let rejectedToolCall: CursorToolCall | undefined;
     let rejectedReason: string | undefined;
+    let forwarded = false;
+
     for await (const event of runSdkBridgeOnce(settings, attemptInput)) {
-      events.push(event);
+      if (event.type === "text" && event.text) sawText = true;
       if (event.type === "tool_call") sawToolCall = true;
       if (event.type === "rejected_tool_call") {
         rejectedToolCall = event.toolCall;
         rejectedReason = event.reason;
+        buffered.push(event);
+        continue;
       }
+
+      if (holdForRetry && !sawToolCall) {
+        buffered.push(event);
+        continue;
+      }
+
+      if (!forwarded) {
+        for (const held of buffered) {
+          if (held.type !== "rejected_tool_call") yield held;
+        }
+        buffered.length = 0;
+        forwarded = true;
+      }
+      yield event;
     }
-    if (sawToolCall) {
-      for (const event of events) yield event;
+
+    if (forwarded || sawToolCall) {
+      for (const held of buffered) {
+        if (held.type !== "rejected_tool_call") yield held;
+      }
       return;
     }
-    lastEvents = events;
-    if ((!rejectedToolCall && !input.requiresLocalTool) || attempt >= TOOL_RETRY_ATTEMPTS) break;
+
+    const shouldRetry =
+      attempt < TOOL_RETRY_ATTEMPTS && (Boolean(rejectedToolCall) || (input.requiresLocalTool && !sawText));
+    if (!shouldRetry) {
+      for (const event of buffered) {
+        if (event.type !== "rejected_tool_call") yield event;
+      }
+      return;
+    }
+
     attemptInput = {
       ...input,
       runId: `run-${crypto.randomUUID()}`,
@@ -74,7 +102,6 @@ export async function* runSdkStream(
         : retryPromptAfterMissingTool(input.prompt, attempt + 1)
     };
   }
-  for (const event of lastEvents) yield event;
 }
 
 export async function collectSdkOutput(stream: AsyncIterable<CursorTextEvent>): Promise<SdkRunOutput> {
@@ -109,7 +136,9 @@ async function* runSdkBridgeOnce(
       model: input.model,
       ...(input.modelParams?.length ? { modelParams: input.modelParams } : {}),
       prompt: input.prompt,
-      incrementalPrompt: input.incrementalPrompt ?? input.prompt,
+      ...(input.incrementalPrompt && input.incrementalPrompt !== input.prompt
+        ? { incrementalPrompt: input.incrementalPrompt }
+        : {}),
       promptAlreadyPrepared: true,
       sessionKey: input.sessionKey,
       workingDirectory: input.workingDirectory ?? "",

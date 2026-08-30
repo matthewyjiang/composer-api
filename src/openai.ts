@@ -640,6 +640,45 @@ export function responseDoneEvents(input: {
   ];
 }
 
+export function responseFailedEvents(input: {
+  id: string;
+  created: number;
+  model: string;
+  message: string;
+  code?: string;
+  metadata?: Record<string, unknown>;
+}): Uint8Array[] {
+  const error = {
+    code: input.code ?? "cursor_stream_error",
+    message: input.message
+  };
+  const response = {
+    id: input.id,
+    object: "response",
+    created_at: input.created,
+    status: "failed",
+    error,
+    incomplete_details: null,
+    model: input.model,
+    output: [],
+    parallel_tool_calls: true,
+    previous_response_id: null,
+    reasoning: { effort: null, summary: null },
+    store: false,
+    tool_choice: "auto",
+    tools: [],
+    truncation: "disabled",
+    usage: null,
+    user: null,
+    metadata: {},
+    ...input.metadata
+  };
+  return [
+    encodeSse({ type: "error", error }, "error"),
+    encodeSse({ type: "response.failed", response }, "response.failed")
+  ];
+}
+
 export function modelList(options: { opencode?: boolean; sdk?: boolean } = {}): Record<string, unknown> {
   return {
     object: "list",

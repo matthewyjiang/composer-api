@@ -10,6 +10,7 @@ import {
   responseCreatedEvents,
   responseDeltaEvent,
   responseDoneEvents,
+  responseFailedEvents,
   responseInputItemsObject,
   responseObject,
   responseTextStartEvents,
@@ -422,9 +423,26 @@ function streamOpenAiEvents(
       }
       await input.onDone(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls);
     } catch (error) {
-      await input.onError(error);
+      await input.onError(error).catch(() => undefined);
       const message = error instanceof Error ? error.message : "Stream failed";
-      await writer.write(encodeSse({ error: { message, type: "cursor_error", code: "cursor_stream_error" } }, "error"));
+      console.error(`OpenAI SSE stream failed: ${message}`);
+      try {
+        if (kind === "chat") {
+          await writer.write(encodeSse({ error: { message, type: "cursor_error", code: "cursor_stream_error" } }, "error"));
+        } else {
+          for (const event of responseFailedEvents({
+            id: input.id,
+            created: input.created,
+            model: input.model,
+            message,
+            metadata: input.metadata
+          })) {
+            await writer.write(event);
+          }
+        }
+      } catch {
+        // Client already dropped the SSE connection.
+      }
     } finally {
       await writer.close().catch(() => undefined);
     }

@@ -15,7 +15,11 @@ loadEnvFile(path.join(process.cwd(), ".env"));
 const host = process.env.CURSOR_SDK_BRIDGE_HOST || "127.0.0.1";
 const port = parseInteger(process.env.CURSOR_SDK_BRIDGE_PORT, 8792);
 const bridgeToken = process.env.CURSOR_SDK_BRIDGE_TOKEN || "";
-const maxJsonBytes = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_JSON_BYTES, 1024 * 1024);
+// Largest catalog context is 256k tokens (grok-4.6). At ~4 bytes/token that is
+// 1 MiB of prompt text; JSON escaping and tool specs push a long Rho session
+// well past that. The old 1 MiB cap rejected those POSTs, and the Responses
+// SSE then closed after response.created with no content.
+const maxJsonBytes = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_JSON_BYTES, 32 * 1024 * 1024);
 const maxAgents = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_AGENTS, 128);
 const runTimeoutMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS, 180 * 1000);
 const maxRunRetries = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_RUN_RETRIES, 3);
@@ -70,6 +74,11 @@ function startServer() {
       writeJson(response, openAiError(error), statusFromError(error));
     });
   });
+  // Cursor runs can sit idle while thinking; Node's 300s requestTimeout would
+  // kill the NDJSON stream before the SDK 180s run timeout can fire.
+  server.requestTimeout = 0;
+  server.headersTimeout = 0;
+  server.timeout = 0;
   server.listen(port, host, () => {
     console.log(`Cursor SDK local-agent bridge listening on http://${host}:${port}/sdk`);
   });
@@ -2116,7 +2125,7 @@ async function readJsonBody(request) {
   let body = "";
   for await (const chunk of request) {
     body += chunk;
-    if (body.length > maxJsonBytes) throw new HttpError("Request body too large", 413, "request_too_large");
+    if (Buffer.byteLength(body) > maxJsonBytes) throw new HttpError("Request body too large", 413, "request_too_large");
   }
   if (!body.trim()) return {};
   try {

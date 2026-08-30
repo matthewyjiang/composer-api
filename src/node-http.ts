@@ -22,6 +22,7 @@ export async function writeNodeResponse(res: ServerResponse, response: Response)
     headers[key] = value;
   });
   res.writeHead(response.status, headers);
+  res.flushHeaders();
   if (!response.body) {
     res.end();
     return;

@@ -121,12 +121,20 @@ async function serve(config: AppConfig): Promise<void> {
       .then((request) => handleRequest(request, ctx))
       .then((response) => writeNodeResponse(res, response))
       .catch((error) => {
+        const message = error instanceof Error ? error.message : "Internal error";
         if (!res.headersSent) {
           res.writeHead(500, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message } }));
+          return;
         }
-        res.end(JSON.stringify({ error: { message: error instanceof Error ? error.message : "Internal error" } }));
+        // SSE headers already went out. Appending JSON would corrupt the stream.
+        res.end();
       });
   });
+  // Streaming Cursor turns can exceed Node's 300s requestTimeout.
+  server.requestTimeout = 0;
+  server.headersTimeout = 0;
+  server.timeout = 0;
 
   await new Promise<void>((resolve, reject) => {
     server.listen(config.port, config.host, () => resolve());
