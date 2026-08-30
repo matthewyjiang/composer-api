@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { HttpError } from "./http.js";
-import { reasoningEffortFromBody, resolveCursorModel } from "./models.js";
+import { COMPOSER_MODELS, localModelList, reasoningEffortFromBody, resolveCursorModel } from "./models.js";
 
 describe("resolveCursorModel", () => {
   it("maps catalog fast variants to SDK fast params", () => {
@@ -70,6 +70,20 @@ describe("resolveCursorModel", () => {
       params: [{ id: "reasoning", value: "high" }],
       reasoningEffort: "high"
     });
+  });
+});
+
+describe("localModelList", () => {
+  it("reports catalog context_length for Rho-style OpenAI hosts", () => {
+    const list = localModelList() as { data: Array<{ id: string; context_length: number }> };
+    for (const model of COMPOSER_MODELS) {
+      expect(list.data.find((item) => item.id === model.id)).toMatchObject({
+        id: model.id,
+        object: "model",
+        owned_by: "cursor",
+        context_length: model.contextWindow
+      });
+    }
   });
 });
 

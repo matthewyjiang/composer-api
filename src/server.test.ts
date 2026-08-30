@@ -41,8 +41,10 @@ describe("local OpenAI server", () => {
     expect(await health.json()).toMatchObject({ object: "api.health", ready: true });
 
     const models = await request("/v1/models", { headers: { authorization: "Bearer local" } });
-    const body = await models.json() as { data: Array<{ id: string }> };
+    const body = await models.json() as { data: Array<{ id: string; context_length?: number }> };
     expect(body.data.map((item) => item.id)).toContain("composer-2.5");
+    expect(body.data.find((item) => item.id === "composer-2.5")?.context_length).toBe(200_000);
+    expect(body.data.find((item) => item.id === "grok-4.6")?.context_length).toBe(256_000);
   });
 
   it("rejects requests when no Cursor key is configured", async () => {

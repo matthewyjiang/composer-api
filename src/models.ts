@@ -381,11 +381,14 @@ export function localModelList(): Record<string, unknown> {
 }
 
 export function modelObject(model: ComposerModel): Record<string, unknown> {
+  // Rho (and LiteLLM/vLLM-style hosts) read context_length from /v1/models.
+  // Official OpenAI omits it; when present and > 0 it wins over models.dev defaults.
   return {
     id: model.id,
     object: "model",
     created: 1_779_148_800,
-    owned_by: "cursor"
+    owned_by: "cursor",
+    context_length: model.contextWindow
   };
 }
 

@@ -140,7 +140,7 @@ For lower time-to-first-token, prefer the `*-fast` model ids (`composer-2.5-fast
 
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
-- `GET /v1/models`
+- `GET /v1/models` (includes `context_length` per model)
 - `POST /v1/completions`
 - `POST /v1/responses/input_tokens`
 - `POST /v1/responses/compact`
