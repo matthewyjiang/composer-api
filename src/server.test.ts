@@ -265,6 +265,95 @@ describe("local OpenAI server", () => {
     expect(new Set(callIds).size).toBe(2);
   });
 
+  it("does not key Responses sessions on workingDirectory", async () => {
+    _resetResponseStateForTests();
+    const keys: string[] = [];
+    const ctx = createContext(config(), { url: "http://127.0.0.1:8792/sdk", token: "bridge" }, {
+      now: () => new Date("2026-08-12T00:00:00Z"),
+      randomUUID: () => "00000000-0000-4000-8000-00000000000" + String(keys.length + 1),
+      runSdk: async function* (_settings, input) {
+        keys.push(input.sessionKey);
+        yield { type: "text", text: "ok" };
+        yield { type: "done", finalText: "ok", toolCalls: [] };
+      }
+    });
+    for (const text of [
+      "First unique conversation AAAA\nWorking directory: /tmp/project",
+      "Second unique conversation BBBB\nWorking directory: /tmp/project"
+    ]) {
+      await handleRequest(
+        new Request("http://127.0.0.1:8787/v1/responses", {
+          method: "POST",
+          headers: { authorization: "Bearer local", "content-type": "application/json" },
+          body: JSON.stringify({ model: "composer-2.5", input: text })
+        }),
+        ctx
+      );
+    }
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).not.toBe(keys[1]);
+  });
+
+  it("correlates stateless Responses follow-ups by structural item prefix", async () => {
+    _resetResponseStateForTests();
+    const keys: string[] = [];
+    let turn = 0;
+    const ctx = createContext(config(), { url: "http://127.0.0.1:8792/sdk", token: "bridge" }, {
+      now: () => new Date("2026-08-12T00:00:00Z"),
+      randomUUID: () => "00000000-0000-4000-8000-00000000000" + String(keys.length + 1),
+      runSdk: async function* (_settings, input) {
+        keys.push(input.sessionKey);
+        turn += 1;
+        if (turn === 1) {
+          yield { type: "tool_call", toolCall: { id: "call_prefix_1", name: "read", arguments: { path: "AGENTS.md" } } };
+          yield { type: "done", finalText: "", toolCalls: [{ id: "call_prefix_1", name: "read", arguments: { path: "AGENTS.md" } }] };
+          return;
+        }
+        yield { type: "text", text: "ok" };
+        yield { type: "done", finalText: "ok", toolCalls: [] };
+      }
+    });
+    const tools = [
+      {
+        type: "function",
+        name: "read_file",
+        parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] }
+      }
+    ];
+    const first = await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          input: [{ type: "message", role: "user", content: "unique prefix transcript zzz" }],
+          tools
+        })
+      }),
+      ctx
+    );
+    const created = await first.json() as { output: Array<{ type?: string; call_id?: string; name?: string; arguments?: string }> };
+    const functionCall = created.output.find((item) => item.type === "function_call");
+    await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          input: [
+            { type: "message", role: "user", content: "unique prefix transcript zzz" },
+            functionCall,
+            { type: "function_call_output", call_id: functionCall?.call_id, output: "docs" }
+          ],
+          tools
+        })
+      }),
+      ctx
+    );
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).toBe(keys[1]);
+  });
+
   it("reuses a conversation session key across Responses turns without previous_response_id", async () => {
     _resetResponseStateForTests();
     const keys: string[] = [];

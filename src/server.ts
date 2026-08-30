@@ -28,7 +28,13 @@ import { collectSdkOutput, runSdkStream, type SdkBridgeSettings } from "./sdk.js
 import type { CursorTextEvent } from "./types.js";
 import { createHash } from "node:crypto";
 
+// 512 stored responses is a few hours of Rho tool loops at one row per turn.
+// LRU already evicts; this is the tripwire, not a guess at peak RAM.
 const RESPONSE_STATE_LIMIT = 512;
+// 256 KiB covers a long tool-loop item list (~64k tokens of JSON). A 32 MiB
+// prompt must not be copied into all 512 slots; oversized states skip prefix
+// correlation and still match on previous_response_id / session affinity.
+const MAX_STORED_TRANSCRIPT_BYTES = 256 * 1024;
 const COMPACTION_INSTRUCTIONS = [
   "You are compacting a long-running local Responses API conversation.",
   "Return a concise continuation summary that preserves user goals, decisions, constraints, important file paths, pending tasks, tool results, and any unresolved errors.",
@@ -201,7 +207,7 @@ async function handlePrepared(
   const sdkSessionKey =
     state?.previousState?.sdkSessionKey
     || sessionAffinity(request)
-    || prepared.toolContext?.workingDirectory
+    || matchSessionByTranscriptPrefix(state?.ownerKey, prepared)
     || conversationSeed(prepared)
     || id;
 
@@ -325,7 +331,8 @@ function sdkInput(prepared: PreparedRequest, apiKey: string, sessionKey: string,
     runId: `run-${ctx.randomUUID()}`,
     workingDirectory: prepared.toolContext?.workingDirectory,
     tools: prepared.tools,
-    requiresLocalTool: prepared.requiresLocalTool
+    requiresLocalTool: prepared.requiresLocalTool,
+    ...(prepared.functionCallOutputs?.length ? { toolResults: prepared.functionCallOutputs } : {})
   };
 }
 
@@ -604,6 +611,87 @@ function sessionAffinity(request: Request): string | undefined {
   )?.trim() || undefined;
 }
 
+function matchSessionByTranscriptPrefix(ownerKey: string | undefined, prepared: PreparedRequest): string | undefined {
+  if (!ownerKey) return undefined;
+  const current = canonicalResponseItems(prepared.responseInputItems ?? []);
+  if (!current.length) return undefined;
+  let best: { sessionKey: string; updatedAt: number } | undefined;
+  for (const stored of responseState.values()) {
+    if (stored.ownerKey !== ownerKey || !stored.sdkSessionKey) continue;
+    const inputPrefix = canonicalResponseItems(stored.inputItems ?? []);
+    const fullPrefix = canonicalResponseItems([...(stored.inputItems ?? []), ...(stored.outputItems ?? [])]);
+    const outputCalls = canonicalResponseItems(stored.outputItems ?? []).filter((item) => isRecord(item) && item.type === "function_call");
+    const exactPrefix = fullPrefix.length > 0 && responseItemsArePrefix(fullPrefix, current);
+    // Rho resends input items plus function_call_output, not assistant message
+    // output items. Require the stored input prefix and every stored function_call.
+    const inputAndCalls = inputPrefix.length > 0
+      && responseItemsArePrefix(inputPrefix, current)
+      && outputCalls.every((call) => current.some((item) => JSON.stringify(item) === JSON.stringify(call)));
+    if (!exactPrefix && !inputAndCalls) continue;
+    if (!best || stored.updatedAt > best.updatedAt) {
+      best = { sessionKey: stored.sdkSessionKey, updatedAt: stored.updatedAt };
+    }
+  }
+  return best?.sessionKey;
+}
+
+function responseItemsArePrefix(prefix: unknown[], current: unknown[]): boolean {
+  if (current.length < prefix.length) return false;
+  for (let index = 0; index < prefix.length; index += 1) {
+    if (JSON.stringify(prefix[index]) !== JSON.stringify(current[index])) return false;
+  }
+  return true;
+}
+
+function canonicalResponseItems(items: unknown[]): unknown[] {
+  return items.map(canonicalResponseItem);
+}
+
+function canonicalResponseItem(item: unknown): unknown {
+  if (typeof item === "string") return { type: "input_text", text: item };
+  if (!isRecord(item)) return item;
+  const type = typeof item.type === "string" ? item.type : typeof item.role === "string" ? "message" : "unknown";
+  if (type === "message" || typeof item.role === "string") {
+    return {
+      type: "message",
+      role: typeof item.role === "string" ? item.role : "user",
+      text: contentTextForPrefix(item.content)
+    };
+  }
+  if (type === "function_call") {
+    return {
+      type: "function_call",
+      call_id: typeof item.call_id === "string" ? item.call_id : "",
+      name: typeof item.name === "string" ? item.name : "",
+      arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {})
+    };
+  }
+  if (type === "function_call_output") {
+    return {
+      type: "function_call_output",
+      call_id: typeof item.call_id === "string" ? item.call_id : "",
+      output: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "")
+    };
+  }
+  return { type, value: item };
+}
+
+function contentTextForPrefix(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return content == null ? "" : JSON.stringify(content);
+  return content.map((part) => {
+    if (typeof part === "string") return part;
+    if (isRecord(part) && typeof part.text === "string") return part.text;
+    return "";
+  }).join("");
+}
+
+function boundedTranscriptItems(items: unknown[]): unknown[] {
+  const json = JSON.stringify(items);
+  if (Buffer.byteLength(json) <= MAX_STORED_TRANSCRIPT_BYTES) return items;
+  return [];
+}
+
 function conversationSeed(prepared: PreparedRequest): string | undefined {
   const text = prepared.prompt.text;
   const user = /\nUSER: (.+)/.exec(text)?.[1]?.trim();
@@ -646,8 +734,8 @@ function storeResponseState(
     ownerKey,
     id: input.id,
     response: input.store ? input.response : undefined,
-    inputItems: input.store ? input.inputItems : [],
-    outputItems: input.outputItems,
+    inputItems: input.store ? boundedTranscriptItems(input.inputItems) : [],
+    outputItems: boundedTranscriptItems(input.outputItems),
     sdkSessionKey: input.sdkSessionKey,
     updatedAt: input.now
   });
