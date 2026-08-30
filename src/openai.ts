@@ -377,9 +377,9 @@ export function responseObject(input: {
       ]
     });
   }
-  for (const [index, toolCall] of (input.toolCalls ?? []).entries()) {
+  for (const toolCall of input.toolCalls ?? []) {
     output.push({
-      id: `fc_${input.id.slice(5)}_${index}`,
+      id: functionCallOutputId(input.id, output.length),
       type: "function_call",
       status: "completed",
       call_id: toolCall.id,
@@ -568,9 +568,13 @@ export function responseDeltaEvent(input: { id: string; delta: string; outputInd
   );
 }
 
+function functionCallOutputId(responseId: string, outputIndex: number): string {
+  return `fc_${responseId.slice(5)}_${outputIndex}`;
+}
+
 export function responseToolCallEvents(input: { id: string; toolCall: OpenAiToolCall; outputIndex: number }): Uint8Array[] {
   const item = {
-    id: `fc_${input.id.slice(5)}_${input.outputIndex}`,
+    id: functionCallOutputId(input.id, input.outputIndex),
     type: "function_call",
     status: "in_progress",
     call_id: input.toolCall.id,

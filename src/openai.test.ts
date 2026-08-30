@@ -1724,6 +1724,48 @@ describe("OpenAI compatibility adapter", () => {
     expect(chunk).toContain('"total_usd"');
   });
 
+  it("numbers function_call output ids by output index so streamed and completed items match", () => {
+    const toolCall = {
+      id: "call_1b89d40d08c2921cf0_read_0",
+      type: "function" as const,
+      function: { name: "read_file", arguments: "{\"path\":\"AGENTS.md\"}" }
+    };
+    const id = "resp_1b89d40d08c2921cf0";
+
+    const withText = responseObject({
+      id,
+      created: 1,
+      model: "composer-2.5",
+      text: "I'll look at the repo's docs.",
+      toolCalls: [toolCall],
+      promptChars: 20
+    });
+    const withTextCalls = (withText.output as Array<{ type: string; id: string; call_id?: string }>).filter(
+      (item) => item.type === "function_call"
+    );
+    expect(withText.output).toHaveLength(2);
+    expect(withTextCalls).toEqual([
+      expect.objectContaining({
+        type: "function_call",
+        id: `fc_${id.slice(5)}_1`,
+        call_id: toolCall.id
+      })
+    ]);
+
+    const toolsOnly = responseObject({
+      id,
+      created: 1,
+      model: "composer-2.5",
+      text: "",
+      toolCalls: [toolCall, { ...toolCall, id: "call_1b89d40d08c2921cf0_read_1" }],
+      promptChars: 20
+    });
+    expect(toolsOnly.output).toEqual([
+      expect.objectContaining({ type: "function_call", id: `fc_${id.slice(5)}_0`, call_id: toolCall.id }),
+      expect.objectContaining({ type: "function_call", id: `fc_${id.slice(5)}_1`, call_id: "call_1b89d40d08c2921cf0_read_1" })
+    ]);
+  });
+
   it("returns OpenAI-shaped tool call responses", () => {
     const toolCalls = toOpenAiToolCalls({
       responseId: "chatcmpl_test",
