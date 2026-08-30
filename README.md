@@ -65,12 +65,13 @@ cursor-api setup opencode # or just one
 cursor-api serve [--host 127.0.0.1] [--port 8787] [--key KEY]
 cursor-api set-key <cursor-api-key>
 cursor-api setup [opencode|codex|vscode|cline|kilo|pi|rho|all]
-cursor-api install-service
-cursor-api uninstall-service
+cursor-api service install
+cursor-api service uninstall
+cursor-api service status
 cursor-api models
 ```
 
-`install-service` writes a systemd user unit to `~/.config/systemd/user/cursor-api.service` and runs `systemctl --user enable --now`. That keeps the API up after login. To keep it up after logout as well:
+`service install` writes a systemd user unit to `~/.config/systemd/user/cursor-api.service` and runs `systemctl --user enable --now`. That keeps the API up after login. `service status` prints `systemctl --user status` for that unit. To keep the API up after logout as well:
 
 ```bash
 loginctl enable-linger "$USER"

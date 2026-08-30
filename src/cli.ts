@@ -7,7 +7,7 @@ import { baseUrl, DISPLAY_NAME, loadConfig, saveApiKey, type AppConfig } from ".
 import { incomingToRequest, writeNodeResponse } from "./node-http.js";
 import { COMPOSER_MODELS } from "./models.js";
 import { createContext, handleRequest } from "./server.js";
-import { installUserService, uninstallUserService } from "./service.js";
+import { installUserService, uninstallUserService, userServiceStatus } from "./service.js";
 import { SETUP_AGENTS, setupAgent, setupAll, type SetupAgent } from "./setup.js";
 
 const HELP = `${DISPLAY_NAME}
@@ -16,8 +16,9 @@ Usage:
   cursor-api serve [options]
   cursor-api set-key <cursor-api-key>
   cursor-api setup [opencode|codex|vscode|cline|kilo|pi|rho|all]
-  cursor-api install-service
-  cursor-api uninstall-service
+  cursor-api service install
+  cursor-api service uninstall
+  cursor-api service status
   cursor-api models
   cursor-api help
 
@@ -88,20 +89,29 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     return 0;
   }
 
-  if (options.command === "install-service") {
-    const result = await installUserService({
-      execPath: process.execPath,
-      scriptPath: cliScriptPath(),
-      extraArgs: options.config ? ["--config", options.config] : []
-    });
-    process.stdout.write(`${result.detail}\n`);
-    return result.enabled ? 0 : 1;
-  }
-
-  if (options.command === "uninstall-service") {
-    const result = await uninstallUserService();
-    process.stdout.write(`${result.detail}\n`);
-    return 0;
+  if (options.command === "service") {
+    const action = (options.args[0] || "").toLowerCase();
+    if (action === "install") {
+      const result = await installUserService({
+        execPath: process.execPath,
+        scriptPath: cliScriptPath(),
+        extraArgs: options.config ? ["--config", options.config] : []
+      });
+      process.stdout.write(`${result.detail}\n`);
+      return result.enabled ? 0 : 1;
+    }
+    if (action === "uninstall") {
+      const result = await uninstallUserService();
+      process.stdout.write(`${result.detail}\n`);
+      return 0;
+    }
+    if (action === "status") {
+      const result = await userServiceStatus();
+      process.stdout.write(`${result.detail}\n`);
+      return result.active ? 0 : 1;
+    }
+    process.stderr.write(`Unknown service command '${action || ""}'. Use: install, uninstall, or status.\n\n${HELP}`);
+    return 1;
   }
 
   if (options.command !== "serve") {

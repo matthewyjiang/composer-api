@@ -8,6 +8,7 @@ import {
   SERVICE_UNIT,
   systemdQuote,
   uninstallUserService,
+  userServiceStatus,
   userUnitPath,
   type CommandResult
 } from "./service.js";
@@ -121,5 +122,26 @@ describe("user service", () => {
       ["systemctl", "--user", "daemon-reload"]
     ]);
     await expect(readFile(unitPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("reports systemctl --user status output", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "cursor-api-service-"));
+    const env = envFor(home);
+    const calls: string[][] = [];
+    const result = await userServiceStatus({
+      home,
+      env,
+      run: recordingRun(calls, [
+        { code: 0, stdout: "Active: active (running)", stderr: "" },
+        { code: 0, stdout: "enabled", stderr: "" }
+      ])
+    });
+    expect(result.active).toBe(true);
+    expect(result.enabled).toBe(true);
+    expect(result.detail).toContain("Active: active (running)");
+    expect(calls).toEqual([
+      ["systemctl", "--user", "status", "--no-pager", SERVICE_UNIT],
+      ["systemctl", "--user", "is-enabled", SERVICE_UNIT]
+    ]);
   });
 });
