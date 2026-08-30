@@ -96,7 +96,7 @@ const TOOL_SYSTEM_DIRECTIVE = [
   "The client tool inventory below is executable. You can inspect files, run shell commands, and edit through those tools when the user asks for project work.",
   "Answer directly only when no tool is needed.",
   "When a provided tool is needed, call it using Cursor Composer's tool-call marker protocol and do not describe the marker as prose.",
-  "Do not emit duplicate tool calls. Call each required operation once, then continue after the client returns the tool result.",
+  "Do not emit duplicate tool calls. Independent inspections can be requested together in one turn. Wait for a tool result only when a later call needs that result.",
   "Never claim that tools are unavailable. Never tell the user to switch modes."
 ].join("\n");
 
@@ -109,7 +109,7 @@ const AGENT_SYSTEM_DIRECTIVE = [
 
 const RESPONSES_TOOL_SYSTEM_DIRECTIVE = [
   "You are serving an OpenAI Responses API request through Cursor Composer.",
-  "The client owns local tool execution. When local inspection, shell commands, or file changes are needed, request a function_call and wait for the function_call_output.",
+  "The client owns local tool execution. When local inspection, shell commands, or file changes are needed, request function_call items. Independent inspections can be requested together in one turn.",
   "When the input includes function_call_output records, treat them as completed local tool results for your previous function_call requests and continue from those results.",
   "If the user explicitly names an allowed client tool, use that tool. Non-builtin client tools and MCP/server tools should be requested with SDK mcp using providerIdentifier, toolName, and args.",
   "For general file creation when no specific client tool is requested, prefer SDK shell when a shell client tool is available; otherwise request write calls with both path and fileText.",
@@ -202,7 +202,7 @@ export function prepareOpencodeSdkChatRequest(body: unknown, _cursorModel?: Reso
   const workspaceMutationDone = workspaceMutationRequired && hasRequiredLocalToolCall(messages, tools, latestUserText);
   const transcript: string[] = [
     "You are running through an SDK-compatible OpenCode harness.",
-    "OpenCode owns local tool execution. When local inspection, shell commands, or file changes are needed, request a tool call and wait for the tool result.",
+    "OpenCode owns local tool execution. When local inspection, shell commands, or file changes are needed, request tool calls. Independent inspections can be requested together in one turn.",
     "When the conversation includes LOCAL OPENCODE TOOL RESULT records, treat them as completed SDK tool_call results for your previous tool requests and continue from those results.",
     "If the user explicitly names an allowed client tool, use that tool. Non-builtin client tools and OpenCode MCP/server tools are called through SDK mcp with providerIdentifier, toolName, and args.",
     "For creating new files when no specific client tool is requested, request write calls with both path and fileText. Do not use edit for new files or emit edit calls without complete replacement details.",
@@ -863,7 +863,7 @@ function appendChatTools(transcript: string[], tools: OpenAiToolSpec[], toolChoi
     `Allowed tool names: ${tools.map((tool) => tool.name).join(", ")}`,
     "Use only the exact tool names above. Use the argument names from each tool's JSON schema.",
     "If the task requires creating or changing files, call write/edit/bash. Do not provide a code block and ask the user to save it.",
-    "To call one tool, output this exact shape and no explanatory prose:",
+    "To call tools, output this exact shape and no explanatory prose. Repeat tool_call_begin...tool_call_end for each independent call:",
     "<|tool_calls_begin|><|tool_call_begin|>",
     "tool_name",
     "<|tool_sep|>argument_name",
@@ -891,7 +891,7 @@ function appendResponsesToolInventory(transcript: string[], tools: OpenAiToolSpe
     "For local work, emit only SDK tool names from the SDK TOOL ROUTING MAP. The adapter forwards those SDK calls to the matching client tool names and schemas.",
     "Prefer built-in SDK routes for shell/read/write/edit/glob/grep/ls-style client tools. Use SDK mcp for unique client tools and MCP/server tools.",
     "When the user names a specific allowed client tool, use the matching SDK TOOL ROUTING MAP route and do not substitute a different tool.",
-    "If you need a local tool, emit the tool call before prose. Do not write progress text such as \"creating the file\" instead of calling a tool."
+    "If you need a local tool, emit the tool call before prose. Independent inspections can be requested together in one turn. Do not write progress text such as \"creating the file\" instead of calling a tool."
   );
   if (hasCompatibleTool("shell", tools)) {
     transcript.push("A shell client tool is available. For general file creation or overwrite requests, prefer an SDK shell call using mkdir -p and a quoted heredoc.");

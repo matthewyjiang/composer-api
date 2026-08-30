@@ -1415,6 +1415,30 @@ describe("OpenAI compatibility adapter", () => {
     expect(prepared.requiresLocalTool).toBe(false);
   });
 
+  it("tells Responses and chat tool prompts to emit independent inspections together", () => {
+    const tools = [
+      {
+        type: "function" as const,
+        function: {
+          name: "grep",
+          parameters: { type: "object", properties: { pattern: { type: "string" } } }
+        }
+      }
+    ];
+    const chat = prepareChatRequest({
+      model: "composer-2.5",
+      messages: [{ role: "user", content: "search" }],
+      tools
+    });
+    const responses = prepareResponsesRequest({
+      model: "composer-2.5",
+      input: "search",
+      tools: [{ type: "function", name: "grep", parameters: { type: "object", properties: { pattern: { type: "string" } } } }]
+    });
+    expect(chat.prompt.text).toContain("Independent inspections can be requested together in one turn");
+    expect(responses.prompt.text).toContain("Independent inspections can be requested together in one turn");
+  });
+
   it("sets a continuation incrementalPrompt from new Responses input only", () => {
     const prepared = prepareResponsesRequest(
       {

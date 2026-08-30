@@ -66,6 +66,39 @@ describe("runSdkStream", () => {
     expect(body?.incrementalPrompt).toBe("TOOL RESULT: README.md");
   });
 
+  it("forwards multiple tool_call events before done", async () => {
+    const events = [];
+    globalThis.fetch = async () =>
+      new Response(
+        ndjsonStream([
+          JSON.stringify({ type: "tool_call", toolCall: { name: "grep", arguments: { pattern: "foo" } } }),
+          JSON.stringify({ type: "tool_call", toolCall: { name: "grep", arguments: { pattern: "bar" } } }),
+          JSON.stringify({
+            type: "done",
+            output: {
+              text: "",
+              toolCalls: [
+                { name: "grep", arguments: { pattern: "foo" } },
+                { name: "grep", arguments: { pattern: "bar" } }
+              ]
+            }
+          })
+        ]),
+        { status: 200 }
+      );
+
+    for await (const event of runSdkStream(
+      settings,
+      input({ tools: [{ name: "grep", parameters: { type: "object", properties: { pattern: { type: "string" } } } }] })
+    )) {
+      events.push(event);
+    }
+    expect(events.filter((event) => event.type === "tool_call")).toEqual([
+      { type: "tool_call", toolCall: { name: "grep", arguments: { pattern: "foo" } } },
+      { type: "tool_call", toolCall: { name: "grep", arguments: { pattern: "bar" } } }
+    ]);
+  });
+
   it("omits incrementalPrompt when it matches the full prompt", async () => {
     let body: Record<string, unknown> | undefined;
     globalThis.fetch = async (_url, init) => {

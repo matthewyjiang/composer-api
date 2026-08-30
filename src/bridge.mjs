@@ -30,6 +30,7 @@ const clientMcpServerMode = "--client-mcp-server";
 const clientToolCallbackPath = "/client-tool-call";
 
 const agentCache = new Map();
+const lastFullPromptByCacheKey = new Map();
 const agentRunQueues = new Map();
 const activeClientToolCaptures = new Map();
 const forceNextRunAgentKeys = new Set();
@@ -65,7 +66,8 @@ export {
   startServer,
   validateClientMcpToolCall,
   toolCallFromDelta,
-  hasDistinctIncrementalPrompt
+  hasDistinctIncrementalPrompt,
+  continuationFromFullPrompt
 };
 
 function startServer() {
@@ -268,44 +270,56 @@ async function runLocalAgentBody(input, onRun, onEvent) {
   const cacheKey = agentCacheKey(input);
   let agentEntry = null;
   let run;
-  let capturedToolCall = null;
+  const capturedToolCalls = [];
+  const capturedToolCallKeys = new Set();
   let cancelRequested = false;
+  let cancelScheduled = false;
   let text = "";
 
-  const captureToolCall = async (toolCall, options = {}) => {
-    if (capturedToolCall || !toolCall) return;
+  const scheduleCancel = () => {
+    if (cancelScheduled) return;
+    cancelScheduled = true;
+    // Same-turn sibling tool-call-started events run before this. Then we
+    // cancel so Cursor does not continue on dummy MCP results.
+    setImmediate(() => {
+      cancelRequested = true;
+      run?.cancel().catch(() => {});
+    });
+  };
+
+  const captureToolCall = async (toolCall) => {
+    if (!toolCall) return;
     const normalized = normalizeSDKToolCall(toolCall, input.clientTools);
     if (!normalized || !isForwardableSDKToolCall(normalized, input.clientTools)) return;
-    capturedToolCall = normalized;
-    if (onEvent) onEvent({ type: "tool_call", toolCall: capturedToolCall });
-    cancelRequested = true;
-    if (run) {
-      const cancellation = run.cancel().catch(() => {
-        // The SDK may already be finishing the local run. The captured model
-        // tool call is still the response we need to return to the client.
-      });
-      if (options.waitForCancel === true) {
-        await cancellation;
-      }
-    }
+    const key = `${normalized.name}:${JSON.stringify(normalized.arguments ?? {})}`;
+    if (capturedToolCallKeys.has(key)) return;
+    capturedToolCallKeys.add(key);
+    capturedToolCalls.push(normalized);
+    if (onEvent) onEvent({ type: "tool_call", toolCall: normalized });
+    scheduleCancel();
   };
 
   const unregisterCapture = registerActiveClientToolCapture(cacheKey, async (toolCall) => {
-    await captureToolCall(toolCall, { waitForCancel: false });
-    return capturedToolCall !== null;
+    await captureToolCall(toolCall);
+    return capturedToolCalls.length > 0;
   });
   try {
     agentEntry = await getAgent(input);
     // Replaying the full OpenAI transcript into a cached Cursor agent restates
-    // the original user request every tool turn. Only reuse the agent when the
-    // client sent a real delta.
-    const reuseCache = agentEntry.cached && hasDistinctIncrementalPrompt(input.prompt, input.incrementalPrompt);
+    // the original user request every tool turn. Reuse only with a real delta:
+    // an explicit incrementalPrompt, or the suffix after the last full prompt.
+    const lastFullPrompt = lastFullPromptByCacheKey.get(agentEntry.cacheKey);
+    const continuation =
+      (hasDistinctIncrementalPrompt(input.prompt, input.incrementalPrompt) && input.incrementalPrompt)
+      || continuationFromFullPrompt(lastFullPrompt, input.prompt);
+    const reuseCache = Boolean(agentEntry.cached && continuation);
     if (agentEntry.cached && !reuseCache) {
       evictAgent(agentEntry.cacheKey, agentEntry.agent);
       agentEntry = await getAgent(input);
     }
     const agent = agentEntry.agent;
-    const prompt = reuseCache ? input.incrementalPrompt : input.prompt;
+    const prompt = reuseCache ? continuation : input.prompt;
+    lastFullPromptByCacheKey.set(agentEntry.cacheKey, input.prompt);
     const force = forceNextRunAgentKeys.delete(cacheKey);
 
     run = await agent.send(prompt, {
@@ -318,41 +332,38 @@ async function runLocalAgentBody(input, onRun, onEvent) {
     });
     onRun(run);
 
-    if (cancelRequested) {
+    if (cancelScheduled) {
       run.cancel().catch(() => {});
     }
 
-    if (!capturedToolCall) {
-      for await (const event of run.stream()) {
-        if (event.type === "assistant") {
-          for (const block of event.message?.content ?? []) {
-            if (block?.type === "text" && typeof block.text === "string") {
-              text += block.text;
-              if (onEvent && block.text) onEvent({ type: "text", text: block.text });
-            }
+    for await (const event of run.stream()) {
+      if (event.type === "assistant") {
+        for (const block of event.message?.content ?? []) {
+          if (block?.type === "text" && typeof block.text === "string") {
+            text += block.text;
+            if (onEvent && block.text) onEvent({ type: "text", text: block.text });
           }
-          continue;
         }
-        if (event.type === "tool_call") {
-          if (event.status && event.status !== "running") continue;
-          await captureToolCall({ type: event.name, args: event.args }, { waitForCancel: false });
-          if (capturedToolCall) break;
-        }
+        continue;
+      }
+      if (event.type === "tool_call") {
+        if (event.status && event.status !== "running") continue;
+        await captureToolCall({ type: event.name, args: event.args });
       }
     }
   } catch (error) {
-    if (!capturedToolCall && !(cancelRequested && isBenignCancellationError(error))) {
+    if (!capturedToolCalls.length && !(cancelRequested && isBenignCancellationError(error))) {
       throw error;
     }
   } finally {
     unregisterCapture();
   }
 
-  if (capturedToolCall) {
+  if (capturedToolCalls.length) {
     if (agentEntry) forceNextRunAgentKeys.add(agentEntry.cacheKey);
     return {
       text: "",
-      toolCalls: [capturedToolCall],
+      toolCalls: capturedToolCalls,
       agentID: agentEntry?.agent.agentId || "",
       runID: run?.id || input.requestId,
       status: "tool_call"
@@ -394,6 +405,7 @@ function evictAgent(cacheKey, agent) {
   if (cached?.agent === agent) {
     agentCache.delete(cacheKey);
   }
+  lastFullPromptByCacheKey.delete(cacheKey);
   forceNextRunAgentKeys.delete(cacheKey);
   try {
     agent.close();
@@ -2018,6 +2030,7 @@ function evictAgents() {
     const oldest = [...agentCache.entries()].sort((a, b) => a[1].touchedAt - b[1].touchedAt)[0];
     if (!oldest) return;
     agentCache.delete(oldest[0]);
+    lastFullPromptByCacheKey.delete(oldest[0]);
     forceNextRunAgentKeys.delete(oldest[0]);
     try {
       oldest[1].agent.close();
@@ -2116,6 +2129,13 @@ function stripFinalMarker(text) {
 
 function hasDistinctIncrementalPrompt(prompt, incrementalPrompt) {
   return typeof incrementalPrompt === "string" && incrementalPrompt.trim() !== "" && incrementalPrompt !== prompt;
+}
+
+function continuationFromFullPrompt(previousPrompt, nextPrompt) {
+  if (typeof previousPrompt !== "string" || typeof nextPrompt !== "string") return undefined;
+  if (!previousPrompt || nextPrompt === previousPrompt || !nextPrompt.startsWith(previousPrompt)) return undefined;
+  const suffix = nextPrompt.slice(previousPrompt.length).trim();
+  return suffix || undefined;
 }
 
 function requiredString(value, key) {

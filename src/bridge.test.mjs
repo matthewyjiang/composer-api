@@ -18,7 +18,8 @@ import {
   statusFromError,
   toolCallFromDelta,
   validateClientMcpToolCall,
-  hasDistinctIncrementalPrompt
+  hasDistinctIncrementalPrompt,
+  continuationFromFullPrompt
 } from "./bridge.mjs";
 
 const bridgeScriptPath = fileURLToPath(new URL("./bridge.mjs", import.meta.url));
@@ -29,6 +30,12 @@ describe("Cursor SDK local-agent bridge", () => {
     expect(hasDistinctIncrementalPrompt("full transcript", "")).toBe(false);
     expect(hasDistinctIncrementalPrompt("full transcript", "full transcript")).toBe(false);
     expect(hasDistinctIncrementalPrompt("full transcript", "TOOL RESULT: README.md")).toBe(true);
+  });
+
+  it("derives a continuation suffix when the next full prompt extends the last one", () => {
+    expect(continuationFromFullPrompt("INPUT:\nUSER: hi", "INPUT:\nUSER: hi\nTOOL RESULT: ok")).toBe("TOOL RESULT: ok");
+    expect(continuationFromFullPrompt("INPUT:\nUSER: hi", "INPUT:\nUSER: hi")).toBeUndefined();
+    expect(continuationFromFullPrompt("INPUT:\nUSER: hi", "INPUT:\nUSER: other")).toBeUndefined();
   });
 
   it("classifies retryable Cursor SDK upstream capacity errors", () => {

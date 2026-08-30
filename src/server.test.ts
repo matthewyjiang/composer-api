@@ -167,6 +167,79 @@ describe("local OpenAI server", () => {
     expect(completedIds).toEqual(streamedIds);
   });
 
+  it("streams multiple function_call items from one SDK turn", async () => {
+    async function* run(): AsyncGenerator<CursorTextEvent> {
+      yield { type: "tool_call", toolCall: { name: "grep", arguments: { pattern: "foo" } } };
+      yield { type: "tool_call", toolCall: { name: "grep", arguments: { pattern: "bar" } } };
+      yield {
+        type: "done",
+        finalText: "",
+        toolCalls: [
+          { name: "grep", arguments: { pattern: "foo" } },
+          { name: "grep", arguments: { pattern: "bar" } }
+        ]
+      };
+    }
+    const ctx = context(run);
+    const response = await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          stream: true,
+          input: "search twice",
+          tools: [
+            {
+              type: "function",
+              name: "grep",
+              parameters: { type: "object", properties: { pattern: { type: "string" } }, required: ["pattern"] }
+            }
+          ]
+        })
+      }),
+      ctx
+    );
+    const callIds: string[] = [];
+    for await (const event of parseSse(response.body)) {
+      if (!event.data || event.data === "[DONE]") continue;
+      const payload = JSON.parse(event.data) as { type?: string; item?: { type?: string; call_id?: string } };
+      if (payload.type === "response.output_item.added" && payload.item?.type === "function_call" && payload.item.call_id) {
+        callIds.push(payload.item.call_id);
+      }
+    }
+    expect(callIds).toHaveLength(2);
+    expect(new Set(callIds).size).toBe(2);
+  });
+
+  it("reuses a conversation session key across Responses turns without previous_response_id", async () => {
+    _resetResponseStateForTests();
+    const keys: string[] = [];
+    const ctx = createContext(config(), { url: "http://127.0.0.1:8792/sdk", token: "bridge" }, {
+      now: () => new Date("2026-08-12T00:00:00Z"),
+      randomUUID: () => "00000000-0000-4000-8000-00000000000" + String(keys.length + 1),
+      runSdk: async function* (_settings, input) {
+        keys.push(input.sessionKey);
+        yield { type: "text", text: "ok" };
+        yield { type: "done", finalText: "ok", toolCalls: [] };
+      }
+    });
+
+    for (const input of ["Hello from a unique prompt 123", "Hello from a unique prompt 123\nTOOL RESULT: x"]) {
+      await handleRequest(
+        new Request("http://127.0.0.1:8787/v1/responses", {
+          method: "POST",
+          headers: { authorization: "Bearer local", "content-type": "application/json" },
+          body: JSON.stringify({ model: "composer-2.5", input })
+        }),
+        ctx
+      );
+    }
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).toBe(keys[1]);
+    expect(keys[0]).toMatch(/^conv_/);
+  });
+
   it("passes new Responses input as incrementalPrompt on previous_response_id follow-up", async () => {
     _resetResponseStateForTests();
     const calls: Array<{ prompt: string; incrementalPrompt?: string; sessionKey: string }> = [];

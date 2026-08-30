@@ -179,6 +179,7 @@ async function* runSdkBridgeOnce(
         responseId: "probe"
       });
       if (input.tools.length && mapped.length === 0) {
+        if (toolCalls.length) continue;
         yield {
           type: "rejected_tool_call",
           toolCall,
@@ -189,8 +190,7 @@ async function* runSdkBridgeOnce(
       }
       toolCalls.push(toolCall);
       yield { type: "tool_call", toolCall };
-      yield { type: "done", finalText: text, toolCalls };
-      return;
+      continue;
     }
     if (event.type === "done" && event.output && typeof event.output === "object") {
       const output = event.output as SdkRunOutput;

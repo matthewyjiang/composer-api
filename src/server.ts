@@ -26,6 +26,7 @@ import { baseUrl, DISPLAY_NAME, resolveRequestApiKey, type AppConfig } from "./c
 import { COMPOSER_MODELS, localModelList, modelById, modelObject, resolveCursorModel } from "./models.js";
 import { collectSdkOutput, runSdkStream, type SdkBridgeSettings } from "./sdk.js";
 import type { CursorTextEvent } from "./types.js";
+import { createHash } from "node:crypto";
 
 const RESPONSE_STATE_LIMIT = 512;
 const COMPACTION_INSTRUCTIONS = [
@@ -198,9 +199,11 @@ async function handlePrepared(
 ): Promise<Response> {
   const created = Math.floor(ctx.now().getTime() / 1000);
   const sdkSessionKey =
-    kind === "responses"
-      ? state?.previousState?.sdkSessionKey || sessionAffinity(request) || id
-      : sessionAffinity(request) || prepared.toolContext?.workingDirectory || id;
+    state?.previousState?.sdkSessionKey
+    || sessionAffinity(request)
+    || prepared.toolContext?.workingDirectory
+    || conversationSeed(prepared)
+    || id;
 
   if (prepared.stream) {
     return streamPrepared(kind, prepared, request, ctx, apiKey, id, created, sdkSessionKey, state?.ownerKey);
@@ -597,6 +600,16 @@ function sessionAffinity(request: Request): string | undefined {
     request.headers.get("x-opencode-session-id") ||
     request.headers.get("x-opencode-session")
   )?.trim() || undefined;
+}
+
+function conversationSeed(prepared: PreparedRequest): string | undefined {
+  const text = prepared.prompt.text;
+  const user = /\nUSER: (.+)/.exec(text)?.[1]?.trim();
+  const inputIdx = text.indexOf("\nINPUT:\n");
+  const inputFirst = inputIdx >= 0 ? text.slice(inputIdx + "\nINPUT:\n".length).split("\n")[0]?.trim() : undefined;
+  const seed = user || inputFirst;
+  if (!seed) return undefined;
+  return `conv_${createHash("sha256").update(seed).digest("hex").slice(0, 24)}`;
 }
 
 function previousResponseIdFromBody(body: unknown): string | undefined {
