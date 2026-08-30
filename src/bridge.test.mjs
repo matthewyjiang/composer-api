@@ -14,12 +14,17 @@ import {
   normalizeSDKToolCall,
   openAiError,
   runExclusiveForAgent,
+  runLocalAgent,
   sdkRunFailureSummary,
   statusFromError,
   toolCallFromDelta,
   validateClientMcpToolCall,
   hasDistinctIncrementalPrompt,
-  continuationFromFullPrompt
+  ingestClientToolCall,
+  isCursorBuiltinToolName,
+  _resetBridgeStateForTests,
+  _setCreateAgentForTests,
+  _setParkedCallTimeoutMsForTests
 } from "./bridge.mjs";
 
 const bridgeScriptPath = fileURLToPath(new URL("./bridge.mjs", import.meta.url));
@@ -32,30 +37,10 @@ describe("Cursor SDK local-agent bridge", () => {
     expect(hasDistinctIncrementalPrompt("full transcript", "TOOL RESULT: README.md")).toBe(true);
   });
 
-  it("derives a continuation suffix when the next full prompt extends the last one", () => {
-    const continued = continuationFromFullPrompt("INPUT:\nUSER: hi", "INPUT:\nUSER: hi\nTOOL RESULT: ok");
-    expect(continued).toContain("Do not restate the user request");
-    expect(continued).toContain("TOOL RESULT: ok");
-    expect(continuationFromFullPrompt("INPUT:\nUSER: hi", "INPUT:\nUSER: hi")).toBeUndefined();
-  });
-
-  it("keeps only new tool results even when the prompt prefix changed", () => {
-    const continued = continuationFromFullPrompt(
-      "OLD HEADER\nINPUT:\nUSER: rename the service command",
-      [
-        "NEW HEADER",
-        "INPUT:",
-        "USER: rename the service command",
-        "ASSISTANT TOOL_CALLS: [{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"grep\",\"arguments\":\"{}\"}}]",
-        "TOOL RESULT (name=grep tool_call_id=call_1): hits",
-        "LOCAL TOOL RESULT: {\"ok\":true}"
-      ].join("\n")
-    );
-    expect(continued).toContain("TOOL RESULT (name=grep tool_call_id=call_1): hits");
-    expect(continued).toContain("LOCAL TOOL RESULT:");
-    expect(continued).not.toContain("ASSISTANT TOOL_CALLS:");
-    expect(continued).not.toContain("rename the service command");
-    expect(continued).not.toContain("NEW HEADER");
+  it("does not treat Cursor builtins as client-forwardable MCP parks", () => {
+    expect(isCursorBuiltinToolName("shell")).toBe(true);
+    expect(isCursorBuiltinToolName("write")).toBe(true);
+    expect(isCursorBuiltinToolName("probe_write_file")).toBe(false);
   });
 
   it("classifies retryable Cursor SDK upstream capacity errors", () => {
@@ -256,7 +241,7 @@ describe("Cursor SDK local-agent bridge", () => {
     expect(toolCallFromDelta(update)).toBe(null);
   });
 
-  it("extracts SDK tool-call starts for early bridge-side cancellation", () => {
+  it("extracts SDK tool-call starts without treating builtins as parked client calls", () => {
     const update = {
       type: "tool-call-started",
       toolCall: {
@@ -272,6 +257,7 @@ describe("Cursor SDK local-agent bridge", () => {
       arguments: { command: "printf OK" }
     });
     expect(isForwardableSDKToolCall(normalized)).toBe(true);
+    expect(isCursorBuiltinToolName(normalized.name)).toBe(true);
   });
 
   it("requires both provider and tool names for SDK MCP forwarding", () => {
@@ -1683,7 +1669,11 @@ describe("Cursor SDK local-agent bridge", () => {
           body: JSON.parse(body)
         };
         response.writeHead(200, { "Content-Type": "application/json" });
-        response.end(JSON.stringify({ ok: true, accepted: true }));
+        response.end(JSON.stringify({
+          ok: true,
+          accepted: true,
+          result: { content: [{ type: "text", text: "CALLBACK_OK" }], isError: false }
+        }));
       });
     });
 
@@ -1697,6 +1687,7 @@ describe("Cursor SDK local-agent bridge", () => {
         CURSOR_SDK_BRIDGE_CALLBACK_URL: `http://127.0.0.1:${port}/client-tool-call`,
         CURSOR_SDK_BRIDGE_CALLBACK_TOKEN: "bridge-token",
         CURSOR_SDK_BRIDGE_AGENT_CACHE_KEY: "cache-key",
+        CURSOR_SDK_BRIDGE_RUN_TOKEN: "run-token",
         CURSOR_SDK_BRIDGE_CLIENT_TOOLS_JSON: JSON.stringify(clientMcpToolDefinitions([]))
       }
     });
@@ -1741,18 +1732,20 @@ describe("Cursor SDK local-agent bridge", () => {
     expect(exitCode).toBe(0);
     expect(stderr).toBe("");
     const response = JSON.parse(stdout.trim());
-    expect(response.result.content[0].text).toBe("FORWARDED_TO_OUTER_CLIENT");
-    expect(observedRequest).toEqual({
+    expect(response.result.content[0].text).toBe("CALLBACK_OK");
+    expect(observedRequest).toMatchObject({
       url: "/client-tool-call",
       authorization: "Bearer bridge-token",
       body: {
         cacheKey: "cache-key",
+        runToken: "run-token",
         toolName: "client_shell",
         arguments: {
           command: "printf CALLBACK_OK"
         }
       }
     });
+    expect(observedRequest.body.callId).toEqual(expect.any(String));
   });
 
   it("keeps exact custom harness MCP tools available in the subcommand server", async () => {
@@ -1771,7 +1764,11 @@ describe("Cursor SDK local-agent bridge", () => {
         };
         setTimeout(() => {
           response.writeHead(200, { "Content-Type": "application/json" });
-          response.end(JSON.stringify({ ok: true, accepted: true }));
+          response.end(JSON.stringify({
+            ok: true,
+            accepted: true,
+            result: { content: [{ type: "text", text: "ISSUE_CREATED" }], isError: false }
+          }));
         }, 50);
       });
     });
@@ -1803,6 +1800,7 @@ describe("Cursor SDK local-agent bridge", () => {
         CURSOR_SDK_BRIDGE_CALLBACK_URL: `http://127.0.0.1:${port}/client-tool-call`,
         CURSOR_SDK_BRIDGE_CALLBACK_TOKEN: "bridge-token",
         CURSOR_SDK_BRIDGE_AGENT_CACHE_KEY: "cache-key",
+        CURSOR_SDK_BRIDGE_RUN_TOKEN: "run-token",
         CURSOR_SDK_BRIDGE_CLIENT_TOOLS_JSON: JSON.stringify(tools)
       }
     });
@@ -1858,12 +1856,13 @@ describe("Cursor SDK local-agent bridge", () => {
     const listResponse = responses.find((response) => response.id === 1);
     const callResponse = responses.find((response) => response.id === 2);
     expect(listResponse.result.tools.some((tool) => tool.name === "mcp__github__create_issue")).toBe(true);
-    expect(callResponse.result.content[0].text).toBe("FORWARDED_TO_OUTER_CLIENT");
-    expect(observedRequest).toEqual({
+    expect(callResponse.result.content[0].text).toBe("ISSUE_CREATED");
+    expect(observedRequest).toMatchObject({
       url: "/client-tool-call",
       authorization: "Bearer bridge-token",
       body: {
         cacheKey: "cache-key",
+        runToken: "run-token",
         toolName: "mcp__github__create_issue",
         arguments: {
           owner: "octo",
@@ -1993,4 +1992,186 @@ describe("Cursor SDK local-agent bridge", () => {
     expect(dynamicSendOptions.mcpServers.client.env.CURSOR_SDK_BRIDGE_CLIENT_TOOLS_JSON).toContain("webfetch");
     expect(dynamicSendOptions.mcpServers.client.env.CURSOR_SDK_BRIDGE_CLIENT_TOOLS_JSON).toContain("probe_write_file");
   });
+
+  it("parks sibling MCP calls independently and resumes the same Cursor run", async () => {
+    const clientTools = [
+      {
+        name: "grep",
+        parameters: {
+          type: "object",
+          properties: { pattern: { type: "string" } },
+          required: ["pattern"]
+        }
+      }
+    ];
+    let runToken = "";
+    let continueText = "";
+    let sendCount = 0;
+    let releaseStream;
+    let sent;
+    const sentP = new Promise((resolve) => {
+      sent = resolve;
+    });
+    const streamGate = new Promise((resolve) => {
+      releaseStream = resolve;
+    });
+    _setCreateAgentForTests(async () => ({
+      agentId: "agent-1",
+      close() {},
+      async send(_prompt, options) {
+        sendCount += 1;
+        runToken = options.mcpServers.client.env.CURSOR_SDK_BRIDGE_RUN_TOKEN;
+        sent();
+        return {
+          id: "run-1",
+          async *stream() {
+            await streamGate;
+            yield { type: "assistant", message: { content: [{ type: "text", text: continueText }] } };
+          },
+          async wait() {
+            return { status: "finished", result: continueText };
+          },
+          async cancel() {}
+        };
+      }
+    }));
+
+    const input = {
+      apiKey: "test-key",
+      model: "composer-2.5",
+      prompt: "search twice",
+      sessionKey: "park-session",
+      workingDirectory: "/tmp/project",
+      requestId: "req-1",
+      clientTools
+    };
+    const firstEvents = [];
+    const first = runLocalAgent(input, (event) => firstEvents.push(event));
+    await sentP;
+    expect(runToken).toBeTruthy();
+
+    const rejected = ingestClientToolCall({
+      runToken: "stale-run",
+      callId: "call_stale",
+      toolName: "grep",
+      arguments: { pattern: "nope" }
+    });
+    expect(rejected.accepted).toBe(false);
+
+    const firstPark = parkedHttp();
+    const secondPark = parkedHttp();
+    const acceptedA = ingestClientToolCall({
+      runToken,
+      callId: "call_a",
+      toolName: "grep",
+      arguments: { pattern: "foo" }
+    }, firstPark.response);
+    const acceptedB = ingestClientToolCall({
+      runToken,
+      callId: "call_b",
+      toolName: "grep",
+      arguments: { pattern: "bar" }
+    }, secondPark.response);
+    expect(acceptedA.accepted).toBe(true);
+    expect(acceptedB.accepted).toBe(true);
+    const firstOutput = await first;
+    expect(firstOutput.status).toBe("tool_call");
+    expect(firstOutput.toolCalls.map((call) => call.id)).toEqual(["call_a", "call_b"]);
+    expect(firstEvents.filter((event) => event.type === "tool_call")).toHaveLength(2);
+
+    continueText = "found both";
+    const secondEvents = [];
+    const resumed = runLocalAgent({
+      ...input,
+      requestId: "req-2",
+      toolResults: [
+        { call_id: "call_a", output: "foo hits" },
+        { call_id: "call_b", output: "bar hits" }
+      ]
+    }, (event) => secondEvents.push(event));
+    const parkedBodies = await Promise.all([firstPark.body, secondPark.body]);
+    expect(parkedBodies[0].result.content[0].text).toBe("foo hits");
+    expect(parkedBodies[1].result.content[0].text).toBe("bar hits");
+    releaseStream();
+    const secondOutput = await resumed;
+    expect(sendCount).toBe(1);
+    expect(secondOutput.text).toBe("found both");
+    expect(secondOutput.toolCalls).toEqual([]);
+    _resetBridgeStateForTests();
+  });
+
+  it("fails a parked call on timeout without awaiting a canceled stream", async () => {
+    _setParkedCallTimeoutMsForTests(40);
+    const clientTools = [
+      {
+        name: "grep",
+        parameters: {
+          type: "object",
+          properties: { pattern: { type: "string" } },
+          required: ["pattern"]
+        }
+      }
+    ];
+    let runToken = "";
+    let cancelled = false;
+    _setCreateAgentForTests(async () => ({
+      agentId: "agent-timeout",
+      close() {},
+      async send(_prompt, options) {
+        runToken = options.mcpServers.client.env.CURSOR_SDK_BRIDGE_RUN_TOKEN;
+        return {
+          id: "run-timeout",
+          async *stream() {
+            await new Promise(() => {});
+          },
+          async wait() {
+            return { status: "cancelled" };
+          },
+          async cancel() {
+            cancelled = true;
+          }
+        };
+      }
+    }));
+    const first = runLocalAgent({
+      apiKey: "test-key",
+      model: "composer-2.5",
+      prompt: "search",
+      sessionKey: "timeout-session",
+      workingDirectory: "/tmp/project",
+      requestId: "req-timeout",
+      clientTools
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const parked = parkedHttp();
+    ingestClientToolCall({
+      runToken,
+      callId: "call_timeout",
+      toolName: "grep",
+      arguments: { pattern: "x" }
+    }, parked.response);
+    await first;
+    const body = await parked.body;
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("timed out");
+    expect(cancelled).toBe(true);
+    _resetBridgeStateForTests();
+  });
 });
+
+function parkedHttp() {
+  let resolveBody;
+  const body = new Promise((resolve) => {
+    resolveBody = resolve;
+  });
+  return {
+    body,
+    response: {
+      writeHead() {},
+      end(data) {
+        const text = Buffer.isBuffer(data) ? data.toString() : String(data);
+        resolveBody(JSON.parse(text));
+      }
+    }
+  };
+}

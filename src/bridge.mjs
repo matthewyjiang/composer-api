@@ -22,11 +22,17 @@ const bridgeToken = process.env.CURSOR_SDK_BRIDGE_TOKEN || "";
 const maxJsonBytes = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_JSON_BYTES, 32 * 1024 * 1024);
 const maxAgents = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_AGENTS, 128);
 const runTimeoutMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS, 180 * 1000);
-// Parallel Cursor tool HTTP hits this process as separate POSTs. Live 8787
-// traces missed siblings inside a setImmediate window; when a burst did land
-// it was consecutive seq with no generation in between. 50ms is above
-// localhost POST spacing and below a new model generation.
-const toolBurstQuietMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_TOOL_BURST_QUIET_MS, 50);
+// Rho/OpenAI clients often take 5–30s for a tool; abandoned tabs sit forever.
+// 120s is below runTimeoutMs so a parked call fails first and we cancel the
+// Cursor run instead of waiting for the whole 180s HTTP-turn timeout.
+const parkedCallTimeoutMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_PARKED_CALL_TIMEOUT_MS, 120 * 1000);
+// Sibling MCP POSTs on localhost are consecutive seq with no generation
+// between them. 25ms is one RTT-and-change; a late sibling parks on its own
+// and joins a later turn instead of being dropped.
+const toolFlushGraceMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_TOOL_FLUSH_GRACE_MS, 25);
+// One pending run per in-flight tool-turn conversation. 64 is half of
+// maxAgents and leaves room for cached agents that are not parked.
+const maxPendingRuns = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_PENDING_RUNS, 64);
 const maxRunRetries = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_RUN_RETRIES, 3);
 const retryBaseDelayMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RETRY_BASE_DELAY_MS, 500);
 const defaultCwd = process.env.CURSOR_SDK_WORKING_DIRECTORY || process.cwd();
@@ -35,10 +41,12 @@ const clientMcpServerMode = "--client-mcp-server";
 const clientToolCallbackPath = "/client-tool-call";
 
 const agentCache = new Map();
-const lastFullPromptByCacheKey = new Map();
 const agentRunQueues = new Map();
-const activeClientToolCaptures = new Map();
-const forceNextRunAgentKeys = new Set();
+const pendingRunsBySession = new Map();
+const pendingRunsByToken = new Map();
+const parkedMcpCalls = new Map();
+let createAgentImpl = defaultCreateAgent;
+let parkedCallTimeoutMsOverride;
 let server = null;
 
 if (isMainModule()) {
@@ -72,7 +80,13 @@ export {
   validateClientMcpToolCall,
   toolCallFromDelta,
   hasDistinctIncrementalPrompt,
-  continuationFromFullPrompt
+  runLocalAgent,
+  ingestClientToolCall,
+  resolveParkedMcpCall,
+  isCursorBuiltinToolName,
+  _resetBridgeStateForTests,
+  _setCreateAgentForTests,
+  _setParkedCallTimeoutMsForTests
 };
 
 function startServer() {
@@ -130,6 +144,7 @@ async function handleRequest(request, response) {
   const workingDirectory = sdkWorkingDirectory(body.workingDirectory);
   const requestId = typeof body.requestId === "string" && body.requestId ? body.requestId : crypto.randomUUID();
   const clientTools = parseClientTools(body.tools);
+  const toolResults = parseToolResults(body.toolResults);
   const streamEvents = body.streamEvents === true;
 
   const input = {
@@ -145,7 +160,8 @@ async function handleRequest(request, response) {
     sessionKey,
     workingDirectory,
     requestId,
-    clientTools
+    clientTools,
+    toolResults
   };
 
   if (streamEvents) {
@@ -164,11 +180,10 @@ async function handleClientToolCallback(request, response) {
   }
 
   const body = await readJsonBody(request);
-  const cacheKey = requiredString(body.cacheKey, "cacheKey");
-  const toolName = requiredString(body.toolName, "toolName");
-  const args = isRecord(body.arguments) ? body.arguments : {};
-  const accepted = await captureActiveClientToolCall(cacheKey, { type: toolName, args });
-  writeJson(response, { ok: true, accepted });
+  const parked = ingestClientToolCall(body, response);
+  if (!parked.accepted) {
+    writeJson(response, { ok: true, accepted: false, callId: parked.callId });
+  }
 }
 
 async function streamLocalAgent(input, response) {
@@ -272,125 +287,309 @@ async function runExclusiveForAgent(input, work) {
 }
 
 async function runLocalAgentBody(input, onRun, onEvent) {
-  const cacheKey = agentCacheKey(input);
-  let agentEntry = null;
-  let run;
-  const capturedToolCalls = [];
-  const capturedToolCallKeys = new Set();
-  let cancelRequested = false;
-  let cancelTimer = null;
-  let text = "";
-
-  const scheduleCancel = () => {
-    if (cancelTimer) clearTimeout(cancelTimer);
-    cancelTimer = setTimeout(() => {
-      cancelRequested = true;
-      run?.cancel().catch(() => {});
-    }, toolBurstQuietMs);
-  };
-
-  const captureToolCall = async (toolCall) => {
-    if (!toolCall) return;
-    const normalized = normalizeSDKToolCall(toolCall, input.clientTools);
-    if (!normalized || !isForwardableSDKToolCall(normalized, input.clientTools)) return;
-    const key = `${normalized.name}:${JSON.stringify(normalized.arguments ?? {})}`;
-    if (capturedToolCallKeys.has(key)) return;
-    capturedToolCallKeys.add(key);
-    capturedToolCalls.push(normalized);
-    if (onEvent) onEvent({ type: "tool_call", toolCall: normalized });
-    scheduleCancel();
-  };
-
-  const unregisterCapture = registerActiveClientToolCapture(cacheKey, async (toolCall) => {
-    await captureToolCall(toolCall);
-    return capturedToolCalls.length > 0;
-  });
-  try {
-    agentEntry = await getAgent(input);
-    // Replaying the full OpenAI transcript into a cached Cursor agent restates
-    // the original user request every tool turn. Reuse only with a real delta:
-    // an explicit incrementalPrompt, or the suffix after the last full prompt.
-    const lastFullPrompt = lastFullPromptByCacheKey.get(agentEntry.cacheKey);
-    const continuation =
-      (hasDistinctIncrementalPrompt(input.prompt, input.incrementalPrompt) && input.incrementalPrompt)
-      || continuationFromFullPrompt(lastFullPrompt, input.prompt);
-    const reuseCache = Boolean(agentEntry.cached && continuation);
-    if (agentEntry.cached && !reuseCache) {
-      evictAgent(agentEntry.cacheKey, agentEntry.agent);
-      agentEntry = await getAgent(input);
+  const existing = pendingRunsBySession.get(input.sessionKey);
+  if (existing && !existing.evicted) {
+    const results = Array.isArray(input.toolResults) ? input.toolResults : [];
+    const matched = results.filter((result) => parkedMcpCalls.has(result.call_id) && parkedMcpCalls.get(result.call_id)?.runToken === existing.runToken);
+    if (matched.length && !existing.streamEnded && !existing.streamError) {
+      onRun(existing.run);
+      return resumePendingRun(existing, matched, onEvent);
     }
-    const agent = agentEntry.agent;
-    const prompt = reuseCache ? continuation : input.prompt;
-    lastFullPromptByCacheKey.set(agentEntry.cacheKey, input.prompt);
-    const force = forceNextRunAgentKeys.delete(cacheKey);
-
-    run = await agent.send(prompt, {
-      ...localAgentSendOptions(input, { force }),
-      idempotencyKey: input.requestId,
-      onDelta: async ({ update }) => {
-        const toolCall = toolCallFromDelta(update);
-        if (toolCall) await captureToolCall(toolCall);
-      }
-    });
-    onRun(run);
-
-    // Wait out the burst quiet window, then cancel. Do not drain run.stream()
-    // after that; the canceled iterator does not end.
-    if (!capturedToolCalls.length) {
-      for await (const event of run.stream()) {
-        if (event.type === "assistant") {
-          if (capturedToolCalls.length) break;
-          for (const block of event.message?.content ?? []) {
-            if (block?.type === "text" && typeof block.text === "string") {
-              text += block.text;
-              if (onEvent && block.text) onEvent({ type: "text", text: block.text });
-            }
-          }
-          continue;
-        }
-        if (event.type === "tool_call") {
-          if (event.status && event.status !== "running") continue;
-          await captureToolCall({ type: event.name, args: event.args });
-        }
-      }
-    }
-    if (capturedToolCalls.length) {
-      await new Promise((resolve) => setTimeout(resolve, toolBurstQuietMs));
-      cancelRequested = true;
-      run.cancel().catch(() => {});
-    }
-  } catch (error) {
-    if (!capturedToolCalls.length && !(cancelRequested && isBenignCancellationError(error))) {
-      throw error;
-    }
-  } finally {
-    unregisterCapture();
+    // No live parked MCP reply for these results (Cursor may have already
+    // timed the tools/call out). Fail remaining parks and start a fresh run
+    // with the tool result already in the prompt.
+    evictPendingRun(existing, "unmatched_or_stale_pending_run");
+    if (existing.agentEntry) evictAgent(existing.agentEntry.cacheKey, existing.agentEntry.agent);
   }
+  return startFreshLocalAgentRun(input, onRun, onEvent);
+}
 
-  if (capturedToolCalls.length) {
-    if (agentEntry) forceNextRunAgentKeys.add(agentEntry.cacheKey);
+async function startFreshLocalAgentRun(input, onRun, onEvent) {
+  const runToken = crypto.randomUUID();
+  let agentEntry = await getAgent(input);
+  const reuseCache = Boolean(
+    agentEntry.cached && hasDistinctIncrementalPrompt(input.prompt, input.incrementalPrompt)
+  );
+  if (agentEntry.cached && !reuseCache) {
+    evictAgent(agentEntry.cacheKey, agentEntry.agent);
+    agentEntry = await getAgent(input);
+  }
+  const prompt = reuseCache ? input.incrementalPrompt : input.prompt;
+  const pending = createPendingRun(input, agentEntry, runToken);
+  const sendInput = { ...input, runToken };
+  try {
+    const run = await agentEntry.agent.send(prompt, {
+      ...localAgentSendOptions(sendInput),
+      idempotencyKey: input.requestId
+    });
+    pending.run = run;
+    onRun(run);
+    startStreamConsumer(pending);
+  } catch (error) {
+    forgetPendingRun(pending);
+    throw error;
+  }
+  return attachConsumerAndWait(pending, onEvent);
+}
+
+async function resumePendingRun(pending, results, onEvent) {
+  for (const result of results) {
+    resolveParkedMcpCall(result.call_id, result.output);
+  }
+  return attachConsumerAndWait(pending, onEvent);
+}
+
+function createPendingRun(input, agentEntry, runToken) {
+  while (pendingRunsBySession.size >= maxPendingRuns) {
+    const oldest = [...pendingRunsBySession.values()].sort((left, right) => left.createdAt - right.createdAt)[0];
+    if (!oldest) break;
+    evictPendingRun(oldest, "pending_run_capacity");
+  }
+  const pending = {
+    sessionKey: input.sessionKey,
+    runToken,
+    cacheKey: agentEntry.cacheKey,
+    input,
+    agentEntry,
+    run: null,
+    parkedCallIds: new Set(),
+    turnParked: [],
+    buffered: [],
+    text: "",
+    streamEnded: false,
+    streamError: null,
+    evicted: false,
+    createdAt: Date.now(),
+    consumer: null,
+    notifyParked: null,
+    consumeLoop: null
+  };
+  pendingRunsBySession.set(input.sessionKey, pending);
+  pendingRunsByToken.set(runToken, pending);
+  return pending;
+}
+
+function startStreamConsumer(pending) {
+  pending.consumeLoop = (async () => {
+    try {
+      for await (const event of pending.run.stream()) {
+        if (pending.evicted) return;
+        handlePendingStreamEvent(pending, event);
+      }
+      pending.streamEnded = true;
+    } catch (error) {
+      if (!pending.evicted) pending.streamError = error;
+    } finally {
+      pending.notifyParked?.();
+    }
+  })();
+}
+
+function handlePendingStreamEvent(pending, event) {
+  if (event.type !== "assistant") return;
+  for (const block of event.message?.content ?? []) {
+    if (block?.type !== "text" || typeof block.text !== "string" || !block.text) continue;
+    const textEvent = { type: "text", text: block.text };
+    if (pending.consumer?.emit) {
+      pending.text += block.text;
+      pending.consumer.emit(textEvent);
+    } else {
+      pending.buffered.push(textEvent);
+    }
+  }
+}
+
+async function attachConsumerAndWait(pending, onEvent) {
+  pending.turnParked = [];
+  pending.consumer = { emit: onEvent };
+  for (const event of pending.buffered) {
+    if (event.type === "text") {
+      pending.text += event.text;
+      onEvent?.(event);
+    } else if (event.type === "tool_call") {
+      pending.turnParked.push(event.toolCall);
+      onEvent?.(event);
+    }
+  }
+  pending.buffered = [];
+  await waitForTurnEnd(pending);
+  pending.consumer = null;
+
+  if (pending.turnParked.length) {
     return {
       text: "",
-      toolCalls: capturedToolCalls,
-      agentID: agentEntry?.agent.agentId || "",
-      runID: run?.id || input.requestId,
+      toolCalls: pending.turnParked,
+      agentID: pending.agentEntry?.agent.agentId || "",
+      runID: pending.run?.id || pending.input.requestId,
       status: "tool_call"
     };
   }
 
-  const result = await run.wait();
+  if (pending.streamError) {
+    const error = pending.streamError;
+    evictPendingRun(pending, "stream_error");
+    throw error;
+  }
+
+  const result = await pending.run.wait();
+  const text = pending.text;
+  const agentEntry = pending.agentEntry;
+  const runId = pending.run?.id;
+  forgetPendingRun(pending);
   if (result.status === "error") {
     if (agentEntry) evictAgent(agentEntry.cacheKey, agentEntry.agent);
     throw sdkRunFailureError(result);
   }
-  if (!text && typeof result.result === "string") text = result.result;
+  const finalText = !text && typeof result.result === "string" ? result.result : text;
   return {
-    text: stripFinalMarker(text),
+    text: stripFinalMarker(finalText),
     toolCalls: [],
     agentID: agentEntry?.agent.agentId || "",
-    runID: run.id,
+    runID: runId,
     status: result.status
   };
+}
+
+function waitForTurnEnd(pending) {
+  return new Promise((resolve) => {
+    let flushTimer = null;
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      pending.notifyParked = null;
+      if (flushTimer) clearTimeout(flushTimer);
+      resolve();
+    };
+    pending.notifyParked = () => {
+      if (pending.evicted || pending.streamError) {
+        done();
+        return;
+      }
+      if (pending.streamEnded && pending.turnParked.length === 0) {
+        done();
+        return;
+      }
+      if (pending.turnParked.length) {
+        if (flushTimer) clearTimeout(flushTimer);
+        flushTimer = setTimeout(done, toolFlushGraceMs);
+      }
+    };
+    pending.notifyParked();
+  });
+}
+
+function currentParkedCallTimeoutMs() {
+  return parkedCallTimeoutMsOverride ?? parkedCallTimeoutMs;
+}
+
+function ingestClientToolCall(body, response) {
+  const runToken = typeof body.runToken === "string" ? body.runToken.trim() : "";
+  const toolName = typeof body.toolName === "string" ? body.toolName : "";
+  const callId = typeof body.callId === "string" && body.callId.trim()
+    ? body.callId.trim()
+    : crypto.randomUUID();
+  const args = isRecord(body.arguments) ? body.arguments : {};
+  const pending = pendingRunsByToken.get(runToken);
+  if (!runToken || !toolName || !pending || pending.evicted) {
+    return { accepted: false, callId };
+  }
+  const normalized = normalizeSDKToolCall({ type: toolName, args }, pending.input.clientTools);
+  if (!normalized) return { accepted: false, callId };
+  if (parkedMcpCalls.has(callId) || pending.parkedCallIds.has(callId)) {
+    return { accepted: false, callId };
+  }
+
+  const toolCall = { ...normalized, id: callId };
+  pending.parkedCallIds.add(callId);
+  const timeout = setTimeout(() => {
+    failParkedMcpCall(callId, "Parked client tool call timed out.");
+    evictPendingRun(pending, "parked_call_timeout");
+  }, currentParkedCallTimeoutMs());
+  parkedMcpCalls.set(callId, {
+    callId,
+    runToken,
+    toolCall,
+    response,
+    timeout,
+    resolved: false
+  });
+  if (pending.consumer?.emit) {
+    pending.turnParked.push(toolCall);
+    pending.consumer.emit({ type: "tool_call", toolCall });
+  } else {
+    pending.buffered.push({ type: "tool_call", toolCall });
+  }
+  pending.notifyParked?.();
+  return { accepted: true, callId };
+}
+
+function resolveParkedMcpCall(callId, output) {
+  const parked = parkedMcpCalls.get(callId);
+  if (!parked || parked.resolved) return false;
+  parked.resolved = true;
+  clearTimeout(parked.timeout);
+  parkedMcpCalls.delete(callId);
+  const pending = pendingRunsByToken.get(parked.runToken);
+  pending?.parkedCallIds.delete(callId);
+  if (parked.response) {
+    writeJson(parked.response, {
+      ok: true,
+      accepted: true,
+      callId,
+      result: mcpToolResultFromOutput(output)
+    });
+  }
+  return true;
+}
+
+function failParkedMcpCall(callId, message) {
+  const parked = parkedMcpCalls.get(callId);
+  if (!parked || parked.resolved) return;
+  parked.resolved = true;
+  clearTimeout(parked.timeout);
+  parkedMcpCalls.delete(callId);
+  const pending = pendingRunsByToken.get(parked.runToken);
+  pending?.parkedCallIds.delete(callId);
+  if (parked.response) {
+    writeJson(parked.response, {
+      ok: true,
+      accepted: true,
+      callId,
+      result: {
+        content: [{ type: "text", text: message }],
+        isError: true
+      }
+    });
+  }
+}
+
+function mcpToolResultFromOutput(output) {
+  const text = typeof output === "string" ? output : JSON.stringify(output ?? "");
+  return {
+    content: [{ type: "text", text }],
+    isError: false
+  };
+}
+
+function evictPendingRun(pending, reason) {
+  if (!pending || pending.evicted) return;
+  pending.evicted = true;
+  for (const callId of [...pending.parkedCallIds]) {
+    failParkedMcpCall(callId, `Parked client tool call ended (${reason}).`);
+  }
+  pending.run?.cancel().catch(() => {});
+  forgetPendingRun(pending);
+  pending.notifyParked?.();
+}
+
+function forgetPendingRun(pending) {
+  if (pendingRunsBySession.get(pending.sessionKey) === pending) {
+    pendingRunsBySession.delete(pending.sessionKey);
+  }
+  if (pendingRunsByToken.get(pending.runToken) === pending) {
+    pendingRunsByToken.delete(pending.runToken);
+  }
 }
 
 async function getAgent(input) {
@@ -401,11 +600,15 @@ async function getAgent(input) {
     return { agent: cached.agent, cacheKey, cached: true };
   }
 
-  const { Agent } = await import("@cursor/sdk");
-  const agent = await Agent.create(localAgentCreateOptions(input));
+  const agent = await createAgentImpl(input);
   agentCache.set(cacheKey, { agent, touchedAt: Date.now() });
   evictAgents();
   return { agent, cacheKey, cached: false };
+}
+
+async function defaultCreateAgent(input) {
+  const { Agent } = await import("@cursor/sdk");
+  return Agent.create(localAgentCreateOptions(input));
 }
 
 function evictAgent(cacheKey, agent) {
@@ -413,8 +616,6 @@ function evictAgent(cacheKey, agent) {
   if (cached?.agent === agent) {
     agentCache.delete(cacheKey);
   }
-  lastFullPromptByCacheKey.delete(cacheKey);
-  forceNextRunAgentKeys.delete(cacheKey);
   try {
     agent.close();
   } catch {}
@@ -426,27 +627,6 @@ function evictCachedAgent(input) {
   if (cached) evictAgent(cacheKey, cached.agent);
 }
 
-function registerActiveClientToolCapture(cacheKey, handler) {
-  if (!activeClientToolCaptures.has(cacheKey)) {
-    activeClientToolCaptures.set(cacheKey, new Set());
-  }
-  const handlers = activeClientToolCaptures.get(cacheKey);
-  handlers.add(handler);
-  return () => {
-    handlers.delete(handler);
-    if (handlers.size === 0) activeClientToolCaptures.delete(cacheKey);
-  };
-}
-
-async function captureActiveClientToolCall(cacheKey, toolCall) {
-  const handlers = activeClientToolCaptures.get(cacheKey);
-  if (!handlers || handlers.size === 0) return false;
-  for (const handler of [...handlers]) {
-    if (await handler(toolCall)) return true;
-  }
-  return false;
-}
-
 function localAgentCreateOptions(input) {
   return {
     apiKey: input.apiKey,
@@ -454,6 +634,8 @@ function localAgentCreateOptions(input) {
     name: "API for Cursor local bridge",
     local: {
       cwd: input.workingDirectory
+      // sandboxOptions in @cursor/sdk 1.0.13 is only { enabled }. It cannot
+      // disable Cursor builtins; we never emit those as client function_calls.
     }
   };
 }
@@ -466,7 +648,7 @@ function localAgentSendOptions(input, optionsInput = {}) {
     options.local = { force: true };
   }
   if (input.clientTools.length > 0) {
-    options.mcpServers = clientForwardingMcpServers(input.clientTools, agentCacheKey(input));
+    options.mcpServers = clientForwardingMcpServers(input.clientTools, agentCacheKey(input), input.runToken || "");
   }
   return options;
 }
@@ -475,7 +657,7 @@ function clientToolsNeedingMcp(clientTools = []) {
   return clientTools.filter((tool) => tool?.name);
 }
 
-function clientForwardingMcpServers(clientTools = [], cacheKey = "") {
+function clientForwardingMcpServers(clientTools = [], cacheKey = "", runToken = "") {
   return {
     [clientMcpServerName]: {
       type: "stdio",
@@ -485,6 +667,8 @@ function clientForwardingMcpServers(clientTools = [], cacheKey = "") {
         CURSOR_SDK_BRIDGE_CALLBACK_URL: `http://${host}:${port}${clientToolCallbackPath}`,
         CURSOR_SDK_BRIDGE_CALLBACK_TOKEN: bridgeToken,
         CURSOR_SDK_BRIDGE_AGENT_CACHE_KEY: cacheKey,
+        CURSOR_SDK_BRIDGE_RUN_TOKEN: runToken,
+        CURSOR_SDK_BRIDGE_PARKED_CALL_TIMEOUT_MS: String(currentParkedCallTimeoutMs()),
         CURSOR_SDK_BRIDGE_CLIENT_TOOLS_JSON: JSON.stringify(clientMcpToolDefinitions(clientTools))
       }
     }
@@ -496,7 +680,9 @@ async function runClientForwardingMcpServerFromEnvironment() {
     tools: parseClientMcpToolsJSON(process.env.CURSOR_SDK_BRIDGE_CLIENT_TOOLS_JSON),
     callbackUrl: process.env.CURSOR_SDK_BRIDGE_CALLBACK_URL || "",
     callbackToken: process.env.CURSOR_SDK_BRIDGE_CALLBACK_TOKEN || "",
-    callbackCacheKey: process.env.CURSOR_SDK_BRIDGE_AGENT_CACHE_KEY || ""
+    callbackCacheKey: process.env.CURSOR_SDK_BRIDGE_AGENT_CACHE_KEY || "",
+    callbackRunToken: process.env.CURSOR_SDK_BRIDGE_RUN_TOKEN || "",
+    parkedCallTimeoutMs: parseInteger(process.env.CURSOR_SDK_BRIDGE_PARKED_CALL_TIMEOUT_MS, 120 * 1000)
   });
 }
 
@@ -515,6 +701,8 @@ async function runClientForwardingMcpServer({
   callbackUrl,
   callbackToken,
   callbackCacheKey,
+  callbackRunToken,
+  parkedCallTimeoutMs: parkedTimeoutMs = 120 * 1000,
   input = process.stdin,
   output = process.stdout
 }) {
@@ -543,6 +731,7 @@ async function runClientForwardingMcpServer({
     writeOutput(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message } })}\n`);
   };
   const pending = new Set();
+  const parkedReplies = new Map();
 
   const handleLine = async (line) => {
     if (!line.trim()) return;
@@ -574,13 +763,29 @@ async function runClientForwardingMcpServer({
         sendError(message.id, validationError);
         return;
       }
-      const accepted = await notifyParentToolCall({ callbackUrl, callbackToken, callbackCacheKey, toolName, input: toolInput });
-      if (!accepted) {
+      const callId = crypto.randomUUID();
+      parkedReplies.set(callId, message.id);
+      const outcome = await notifyParentToolCall({
+        callbackUrl,
+        callbackToken,
+        callbackCacheKey,
+        callbackRunToken,
+        callId,
+        toolName,
+        input: toolInput,
+        timeoutMs: parkedTimeoutMs
+      });
+      parkedReplies.delete(callId);
+      if (!outcome || outcome.accepted !== true) {
         sendError(message.id, "Outer client callback unavailable for forwarded tool call.");
         return;
       }
+      if (outcome.result) {
+        send(message.id, outcome.result);
+        return;
+      }
       send(message.id, {
-        content: [{ type: "text", text: "FORWARDED_TO_OUTER_CLIENT" }],
+        content: [{ type: "text", text: typeof outcome.output === "string" ? outcome.output : "" }],
         isError: false
       });
       return;
@@ -606,10 +811,21 @@ async function runClientForwardingMcpServer({
   });
 }
 
-async function notifyParentToolCall({ callbackUrl, callbackToken, callbackCacheKey, toolName, input }) {
-  if (!callbackUrl || !callbackCacheKey) return true;
+async function notifyParentToolCall({
+  callbackUrl,
+  callbackToken,
+  callbackCacheKey,
+  callbackRunToken,
+  callId,
+  toolName,
+  input,
+  timeoutMs
+}) {
+  if (!callbackUrl || !callbackCacheKey) return { accepted: true, result: { content: [{ type: "text", text: "" }], isError: false } };
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 1500);
+  // Child abort sits 5s past the parent parked-call timeout so the parent
+  // fails the MCP reply first.
+  const timer = setTimeout(() => controller.abort(), Math.max(1000, (timeoutMs || 120 * 1000) + 5000));
   try {
     const headers = { "Content-Type": "application/json" };
     if (callbackToken) headers.Authorization = `Bearer ${callbackToken}`;
@@ -618,16 +834,18 @@ async function notifyParentToolCall({ callbackUrl, callbackToken, callbackCacheK
       headers,
       body: JSON.stringify({
         cacheKey: callbackCacheKey,
+        runToken: callbackRunToken,
+        callId,
         toolName,
         arguments: input && typeof input === "object" && !Array.isArray(input) ? input : {}
       }),
       signal: controller.signal
     });
-    if (!response.ok) return false;
+    if (!response.ok) return { accepted: false };
     const body = await response.json().catch(() => ({}));
-    return body && body.accepted === true;
+    return body && typeof body === "object" ? body : { accepted: false };
   } catch {
-    return false;
+    return { accepted: false };
   } finally {
     clearTimeout(timer);
   }
@@ -637,10 +855,14 @@ function clientForwardingMcpServerSource(clientTools = []) {
   const tools = JSON.stringify(clientMcpToolDefinitions(clientTools));
   return `
 const readline = require("node:readline");
+const { randomUUID } = require("node:crypto");
 const tools = ${tools};
 const callbackUrl = process.env.CURSOR_SDK_BRIDGE_CALLBACK_URL || "";
 const callbackToken = process.env.CURSOR_SDK_BRIDGE_CALLBACK_TOKEN || "";
 const callbackCacheKey = process.env.CURSOR_SDK_BRIDGE_AGENT_CACHE_KEY || "";
+const callbackRunToken = process.env.CURSOR_SDK_BRIDGE_RUN_TOKEN || "";
+const parkedCallTimeoutMs = Number.parseInt(process.env.CURSOR_SDK_BRIDGE_PARKED_CALL_TIMEOUT_MS || "", 10) || 120000;
+const parkedReplies = new Map();
 const validateClientMcpToolCall = ${validateClientMcpToolCall.toString()};
 const validateJsonSchemaValue = ${validateJsonSchemaValue.toString()};
 const canonicalJsonSchema = ${canonicalJsonSchema.toString()};
@@ -687,10 +909,10 @@ function sendError(id, message) {
   if (id === undefined || id === null) return;
   writeStdout(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message } }) + "\\n");
 }
-async function notifyParentToolCall(toolName, input) {
-  if (!callbackUrl || !callbackCacheKey) return true;
+async function notifyParentToolCall(toolName, input, callId) {
+  if (!callbackUrl || !callbackCacheKey) return { accepted: true, result: { content: [{ type: "text", text: "" }], isError: false } };
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 1500);
+  const timer = setTimeout(() => controller.abort(), Math.max(1000, parkedCallTimeoutMs + 5000));
   try {
     const headers = { "Content-Type": "application/json" };
     if (callbackToken) headers.Authorization = "Bearer " + callbackToken;
@@ -699,16 +921,18 @@ async function notifyParentToolCall(toolName, input) {
       headers,
       body: JSON.stringify({
         cacheKey: callbackCacheKey,
+        runToken: callbackRunToken,
+        callId,
         toolName,
         arguments: input && typeof input === "object" && !Array.isArray(input) ? input : {}
       }),
       signal: controller.signal
     });
-    if (!response.ok) return false;
+    if (!response.ok) return { accepted: false };
     const body = await response.json().catch(() => ({}));
-    return body && body.accepted === true;
+    return body && typeof body === "object" ? body : { accepted: false };
   } catch {
-    return false;
+    return { accepted: false };
   } finally {
     clearTimeout(timer);
   }
@@ -739,13 +963,20 @@ rl.on("line", async (line) => {
       sendError(message.id, validationError);
       return;
     }
-    const accepted = await notifyParentToolCall(toolName, input);
-    if (!accepted) {
+    const callId = randomUUID();
+    parkedReplies.set(callId, message.id);
+    const outcome = await notifyParentToolCall(toolName, input, callId);
+    parkedReplies.delete(callId);
+    if (!outcome || outcome.accepted !== true) {
       sendError(message.id, "Outer client callback unavailable for forwarded tool call.");
       return;
     }
+    if (outcome.result) {
+      send(message.id, outcome.result);
+      return;
+    }
     send(message.id, {
-      content: [{ type: "text", text: "FORWARDED_TO_OUTER_CLIENT" }],
+      content: [{ type: "text", text: typeof outcome.output === "string" ? outcome.output : "" }],
       isError: false
     });
   } else {
@@ -2038,8 +2269,6 @@ function evictAgents() {
     const oldest = [...agentCache.entries()].sort((a, b) => a[1].touchedAt - b[1].touchedAt)[0];
     if (!oldest) return;
     agentCache.delete(oldest[0]);
-    lastFullPromptByCacheKey.delete(oldest[0]);
-    forceNextRunAgentKeys.delete(oldest[0]);
     try {
       oldest[1].agent.close();
     } catch {}
@@ -2139,41 +2368,36 @@ function hasDistinctIncrementalPrompt(prompt, incrementalPrompt) {
   return typeof incrementalPrompt === "string" && incrementalPrompt.trim() !== "" && incrementalPrompt !== prompt;
 }
 
-function promptLinesByPrefix(prompt, prefix) {
-  if (typeof prompt !== "string" || !prompt) return [];
-  return prompt.split("\n").filter((line) => line.startsWith(prefix));
+function parseToolResults(value) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!isRecord(item) || typeof item.call_id !== "string" || !item.call_id.trim()) return [];
+    const output = typeof item.output === "string" ? item.output : item.output == null ? "" : JSON.stringify(item.output);
+    return [{ call_id: item.call_id.trim(), output }];
+  });
 }
 
-function continuationFromFullPrompt(previousPrompt, nextPrompt) {
-  if (typeof previousPrompt !== "string" || typeof nextPrompt !== "string") return undefined;
-  if (!previousPrompt || nextPrompt === previousPrompt) return undefined;
-
-  const newToolResults = promptLinesByPrefix(nextPrompt, "LOCAL TOOL RESULT:")
-    .filter((line) => !promptLinesByPrefix(previousPrompt, "LOCAL TOOL RESULT:").includes(line));
-  const newToolText = promptLinesByPrefix(nextPrompt, "TOOL RESULT")
-    .filter((line) => !promptLinesByPrefix(previousPrompt, "TOOL RESULT").includes(line));
-  const newUsers = promptLinesByPrefix(nextPrompt, "USER:")
-    .filter((line) => !promptLinesByPrefix(previousPrompt, "USER:").includes(line));
-
-  const parts = [...newUsers, ...newToolText, ...newToolResults];
-  let kept = parts.join("\n").trim();
-
-  if (!kept && nextPrompt.startsWith(previousPrompt)) {
-    kept = nextPrompt.slice(previousPrompt.length).split("\n").filter((line) => {
-      const trimmed = line.trim();
-      if (!trimmed) return false;
-      if (trimmed.startsWith("ASSISTANT TOOL_CALLS:")) return false;
-      if (trimmed.startsWith("ASSISTANT:")) return false;
+function isCursorBuiltinToolName(name) {
+  switch (canonicalToolName(name)) {
+    case "shell":
+    case "write":
+    case "read":
+    case "edit":
+    case "delete":
+    case "glob":
+    case "grep":
+    case "ls":
+    case "readlints":
+    case "semsearch":
+    case "todowrite":
+    case "task":
+    case "createplan":
+    case "generateimage":
+    case "recordscreen":
       return true;
-    }).join("\n").trim();
+    default:
+      return false;
   }
-
-  if (!kept) return undefined;
-  return [
-    "New local tool results only. Do not restate the user request. Continue from these results:",
-    "",
-    kept
-  ].join("\n");
 }
 
 function requiredString(value, key) {
@@ -2487,4 +2711,25 @@ async function closeAndExit(code) {
 
 function isMainModule() {
   return process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+}
+
+function _resetBridgeStateForTests() {
+  for (const pending of [...pendingRunsBySession.values()]) {
+    evictPendingRun(pending, "test_reset");
+  }
+  pendingRunsBySession.clear();
+  pendingRunsByToken.clear();
+  parkedMcpCalls.clear();
+  agentCache.clear();
+  agentRunQueues.clear();
+  createAgentImpl = defaultCreateAgent;
+  parkedCallTimeoutMsOverride = undefined;
+}
+
+function _setCreateAgentForTests(factory) {
+  createAgentImpl = factory || defaultCreateAgent;
+}
+
+function _setParkedCallTimeoutMsForTests(value) {
+  parkedCallTimeoutMsOverride = value;
 }

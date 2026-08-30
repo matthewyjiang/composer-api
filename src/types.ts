@@ -15,6 +15,8 @@ export interface CursorPrompt {
 export interface CursorToolCall {
   name: string;
   arguments: Record<string, unknown>;
+  /** Bridge-generated MCP call id, reused as the OpenAI function_call call_id. */
+  id?: string;
 }
 
 export type CursorTextEvent =
