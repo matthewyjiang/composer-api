@@ -2196,7 +2196,7 @@ function usageFromReport(
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
     total_tokens: promptTokens + completionTokens,
-    prompt_tokens_details: { cached_tokens: cachedTokens, audio_tokens: 0 },
+    prompt_tokens_details: chatPromptTokenDetails(promptTokens, cachedTokens),
     completion_tokens_details: {
       reasoning_tokens: reported.reasoningTokens ?? 0,
       audio_tokens: 0,
@@ -2219,7 +2219,7 @@ function responseUsageFromReport(
   const outputTokens = reported.outputTokens;
   return {
     input_tokens: promptTokens,
-    input_tokens_details: { cached_tokens: cachedTokens },
+    input_tokens_details: responseInputTokenDetails(promptTokens, cachedTokens),
     output_tokens: outputTokens,
     output_tokens_details: { reasoning_tokens: reported.reasoningTokens ?? 0 },
     total_tokens: promptTokens + outputTokens,
@@ -2240,7 +2240,7 @@ function usageFromChars(model: string, promptChars: number, completionChars: num
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
     total_tokens: promptTokens + completionTokens,
-    prompt_tokens_details: { cached_tokens: cachedTokens, audio_tokens: 0 },
+    prompt_tokens_details: chatPromptTokenDetails(promptTokens, cachedTokens),
     completion_tokens_details: {
       reasoning_tokens: 0,
       audio_tokens: 0,
@@ -2257,7 +2257,7 @@ function responseUsageFromChars(model: string, inputChars: number, outputChars: 
   const cachedTokens = cachedTokensFromChars(inputTokens, cachedChars);
   return {
     input_tokens: inputTokens,
-    input_tokens_details: { cached_tokens: cachedTokens },
+    input_tokens_details: responseInputTokenDetails(inputTokens, cachedTokens),
     output_tokens: outputTokens,
     output_tokens_details: { reasoning_tokens: 0 },
     total_tokens: inputTokens + outputTokens,
@@ -2265,17 +2265,35 @@ function responseUsageFromChars(model: string, inputChars: number, outputChars: 
   };
 }
 
+function billedInputTokens(inputTokens: number, cachedTokens = 0) {
+  const cached = Math.min(Math.max(0, cachedTokens), inputTokens);
+  return { cached, uncached: inputTokens - cached };
+}
+
+function chatPromptTokenDetails(inputTokens: number, cachedTokens = 0) {
+  const { cached, uncached } = billedInputTokens(inputTokens, cachedTokens);
+  return { cached_tokens: cached, uncached_tokens: uncached, audio_tokens: 0 };
+}
+
+function responseInputTokenDetails(inputTokens: number, cachedTokens = 0) {
+  const { cached, uncached } = billedInputTokens(inputTokens, cachedTokens);
+  return { cached_tokens: cached, uncached_tokens: uncached };
+}
+
 function costFromTokens(model: string, inputTokens: number, outputTokens: number, cachedTokens = 0) {
   const pricing = pricingForModel(model);
   if (!pricing) return null;
-  const cached = Math.min(Math.max(0, cachedTokens), inputTokens);
-  const uncached = inputTokens - cached;
-  const inputUsd = roundUsd((uncached / 1_000_000) * pricing.input + (cached / 1_000_000) * pricing.cacheRead);
+  const { cached, uncached } = billedInputTokens(inputTokens, cachedTokens);
+  const uncachedUsd = roundUsd((uncached / 1_000_000) * pricing.input);
   const cacheReadUsd = roundUsd((cached / 1_000_000) * pricing.cacheRead);
+  const inputUsd = roundUsd(uncachedUsd + cacheReadUsd);
   const outputUsd = roundUsd((outputTokens / 1_000_000) * pricing.output);
   return {
     currency: "USD",
     estimated: true,
+    uncached_tokens: uncached,
+    cached_tokens: cached,
+    uncached_usd: uncachedUsd,
     input_usd: inputUsd,
     cache_read_usd: cacheReadUsd,
     output_usd: outputUsd,

@@ -99,12 +99,59 @@ describe("local OpenAI server", () => {
       context(run)
     );
     const body = await response.json() as {
-      usage: { prompt_tokens: number; completion_tokens: number; prompt_tokens_details: { cached_tokens: number } };
+      usage: {
+        prompt_tokens: number;
+        completion_tokens: number;
+        prompt_tokens_details: { cached_tokens: number; uncached_tokens: number };
+        cost: { uncached_tokens: number; cached_tokens: number };
+      };
     };
     expect(body.usage).toMatchObject({
       prompt_tokens: 1000,
       completion_tokens: 10,
-      prompt_tokens_details: { cached_tokens: 800 }
+      prompt_tokens_details: { cached_tokens: 800, uncached_tokens: 200 },
+      cost: { uncached_tokens: 200, cached_tokens: 800, uncached_usd: 0.0001 }
+    });
+  });
+
+  it("reports uncached tokens on Responses usage when Cursor reports cache reads", async () => {
+    async function* run(): AsyncGenerator<CursorTextEvent> {
+      yield { type: "text", text: "ok" };
+      yield {
+        type: "done",
+        finalText: "ok",
+        toolCalls: [],
+        usage: {
+          inputTokens: 200,
+          outputTokens: 10,
+          cacheReadTokens: 800,
+          cacheWriteTokens: 0,
+          totalTokens: 1010
+        }
+      };
+    }
+    const response = await handleRequest(
+      new Request("http://127.0.0.1:8787/v1/responses", {
+        method: "POST",
+        headers: { authorization: "Bearer local", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2.5",
+          input: "Hello"
+        })
+      }),
+      context(run)
+    );
+    const body = await response.json() as {
+      usage: {
+        input_tokens: number;
+        input_tokens_details: { cached_tokens: number; uncached_tokens: number };
+        cost: { uncached_tokens: number };
+      };
+    };
+    expect(body.usage).toMatchObject({
+      input_tokens: 1000,
+      input_tokens_details: { cached_tokens: 800, uncached_tokens: 200 },
+      cost: { uncached_tokens: 200, cached_tokens: 800, uncached_usd: 0.0001 }
     });
   });
 

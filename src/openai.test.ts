@@ -1904,8 +1904,11 @@ describe("OpenAI compatibility adapter", () => {
 
       expect(miss.usage).toMatchObject({
         prompt_tokens: 1000,
-        prompt_tokens_details: { cached_tokens: 0 },
+        prompt_tokens_details: { cached_tokens: 0, uncached_tokens: 1000 },
         cost: {
+          uncached_tokens: 1000,
+          cached_tokens: 0,
+          uncached_usd: 0.0005,
           input_usd: 0.0005,
           cache_read_usd: 0,
           output_usd: 0.00025,
@@ -1919,8 +1922,11 @@ describe("OpenAI compatibility adapter", () => {
       });
       expect(hit.usage).toMatchObject({
         prompt_tokens: 1000,
-        prompt_tokens_details: { cached_tokens: 800 },
+        prompt_tokens_details: { cached_tokens: 800, uncached_tokens: 200 },
         cost: {
+          uncached_tokens: 200,
+          cached_tokens: 800,
+          uncached_usd: 0.0001,
           input_usd: 0.00026,
           cache_read_usd: 0.00016,
           output_usd: 0.00025,
@@ -1956,8 +1962,11 @@ describe("OpenAI compatibility adapter", () => {
     expect(exclusive.usage).toMatchObject({
       prompt_tokens: 1000,
       completion_tokens: 10,
-      prompt_tokens_details: { cached_tokens: 800 },
+      prompt_tokens_details: { cached_tokens: 800, uncached_tokens: 200 },
       cost: {
+        uncached_tokens: 200,
+        cached_tokens: 800,
+        uncached_usd: 0.0001,
         input_usd: 0.00026,
         cache_read_usd: 0.00016,
         output_usd: 0.000025,
@@ -1981,7 +1990,28 @@ describe("OpenAI compatibility adapter", () => {
     });
     expect(inclusive.usage).toMatchObject({
       prompt_tokens: 1000,
-      prompt_tokens_details: { cached_tokens: 800 }
+      prompt_tokens_details: { cached_tokens: 800, uncached_tokens: 200 },
+      cost: { uncached_tokens: 200, cached_tokens: 800 }
+    });
+
+    const response = responseObject({
+      id: "resp_sdk",
+      created: 1,
+      model: "composer-2.5",
+      text: "ok",
+      promptChars: 20,
+      reportedUsage: {
+        inputTokens: 200,
+        outputTokens: 10,
+        cacheReadTokens: 800,
+        cacheWriteTokens: 0,
+        totalTokens: 1010
+      }
+    });
+    expect(response.usage).toMatchObject({
+      input_tokens: 1000,
+      input_tokens_details: { cached_tokens: 800, uncached_tokens: 200 },
+      cost: { uncached_tokens: 200, cached_tokens: 800, uncached_usd: 0.0001 }
     });
   });
 
