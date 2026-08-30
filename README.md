@@ -52,7 +52,7 @@ const completion = await client.chat.completions.create({
 });
 ```
 
-To set up a coding agent (opencode, codex, vscode, cline, kilo, or pi) to use the local server automatically:
+To set up a coding agent (opencode, codex, vscode, cline, kilo, pi, or rho) to use the local server automatically:
 
 ```bash
 cursor-api setup          # configure all of them
@@ -64,7 +64,7 @@ cursor-api setup opencode # or just one
 ```bash
 cursor-api serve [--host 127.0.0.1] [--port 8787] [--key KEY]
 cursor-api set-key <cursor-api-key>
-cursor-api setup [opencode|codex|vscode|cline|kilo|pi|all]
+cursor-api setup [opencode|codex|vscode|cline|kilo|pi|rho|all]
 cursor-api models
 ```
 

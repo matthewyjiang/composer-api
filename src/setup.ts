@@ -4,7 +4,7 @@ import path from "node:path";
 import { baseUrl, configHome, DISPLAY_NAME, type AppConfig } from "./config.js";
 import { agentModelDefinition, COMPOSER_MODELS } from "./models.js";
 
-export const SETUP_AGENTS = ["opencode", "codex", "vscode", "cline", "kilo", "pi"] as const;
+export const SETUP_AGENTS = ["opencode", "codex", "vscode", "cline", "kilo", "pi", "rho"] as const;
 export type SetupAgent = (typeof SETUP_AGENTS)[number];
 
 export interface SetupResult {
@@ -28,6 +28,8 @@ export async function setupAgent(id: SetupAgent, config: AppConfig, home = os.ho
       return installKilo(ctx);
     case "pi":
       return installPi(ctx);
+    case "rho":
+      return installRho(ctx);
   }
 }
 
@@ -187,6 +189,21 @@ async function installPi(ctx: SetupContext): Promise<SetupResult> {
   return { id: "pi", configPath, detail: "Pi provider installed" };
 }
 
+async function installRho(ctx: SetupContext): Promise<SetupResult> {
+  const rhoHome = ctx.env.RHO_HOME?.trim() || path.join(ctx.home, ".rho");
+  const configPath = path.join(rhoHome, "config.toml");
+  let text = await readText(configPath);
+  text = replaceTomlBlock(text, "providers.custom.cursorapi", "").trim();
+  const block = `
+[providers.custom.cursorapi]
+base_url = "${baseUrl(ctx.config)}"
+api = "responses"
+`.trim();
+  text = text ? `${text}\n\n${block}\n` : `${block}\n`;
+  await writeText(configPath, text);
+  return { id: "rho", configPath, detail: "Rho provider installed" };
+}
+
 function vscodeLanguageModelsPath(ctx: SetupContext): string {
   const names = ["Code", "Code - Insiders", "VSCodium", "Cursor", "Windsurf"];
   for (const name of names) {
@@ -215,7 +232,7 @@ function clineModelInfo(id: string): Record<string, unknown> {
 
 function replaceTomlBlock(text: string, name: string, replacement: string): string {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(`^\\[${escaped}\\]\\n[\\s\\S]*?(?=^\\[|\\z)`, "m");
+  const pattern = new RegExp(`^\\[${escaped}\\]\\n[\\s\\S]*?(?=^\\[|$(?![\\s\\S]))`, "m");
   return text.replace(pattern, replacement ? `${replacement}\n` : "");
 }
 

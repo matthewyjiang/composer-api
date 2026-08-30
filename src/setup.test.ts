@@ -50,6 +50,24 @@ describe("agent setup", () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "cursor-api-setup-"));
     const env = { XDG_CONFIG_HOME: path.join(home, ".config") };
     const results = await setupAll(config(home), home, env);
-    expect(results.map((item) => item.id)).toEqual(["opencode", "codex", "vscode", "cline", "kilo", "pi"]);
+    expect(results.map((item) => item.id)).toEqual(["opencode", "codex", "vscode", "cline", "kilo", "pi", "rho"]);
+  });
+
+  it("writes a Rho custom provider block", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "cursor-api-setup-"));
+    const result = await setupAgent("rho", config(home), home, {});
+    expect(result.configPath).toBe(path.join(home, ".rho", "config.toml"));
+    const text = await readFile(result.configPath, "utf8");
+    expect(text).toContain("[providers.custom.cursorapi]");
+    expect(text).toContain('base_url = "http://127.0.0.1:8787/v1"');
+    expect(text).toContain('api = "responses"');
+  });
+
+  it("replaces an existing Rho provider block without touching other config", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "cursor-api-setup-"));
+    await setupAgent("rho", config(home), home, {});
+    const result = await setupAgent("rho", config(home), home, {});
+    const text = await readFile(result.configPath, "utf8");
+    expect(text.match(/\[providers\.custom\.cursorapi\]/g)?.length).toBe(1);
   });
 });

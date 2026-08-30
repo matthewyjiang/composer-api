@@ -14,7 +14,7 @@ const HELP = `${DISPLAY_NAME}
 Usage:
   cursor-api serve [options]
   cursor-api set-key <cursor-api-key>
-  cursor-api setup [opencode|codex|vscode|cline|kilo|pi|all]
+  cursor-api setup [opencode|codex|vscode|cline|kilo|pi|rho|all]
   cursor-api models
   cursor-api help
 
