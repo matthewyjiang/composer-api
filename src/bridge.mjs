@@ -22,6 +22,11 @@ const bridgeToken = process.env.CURSOR_SDK_BRIDGE_TOKEN || "";
 const maxJsonBytes = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_JSON_BYTES, 32 * 1024 * 1024);
 const maxAgents = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_AGENTS, 128);
 const runTimeoutMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS, 180 * 1000);
+// Parallel Cursor tool HTTP hits this process as separate POSTs. Live 8787
+// traces missed siblings inside a setImmediate window; when a burst did land
+// it was consecutive seq with no generation in between. 50ms is above
+// localhost POST spacing and below a new model generation.
+const toolBurstQuietMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_TOOL_BURST_QUIET_MS, 50);
 const maxRunRetries = parseInteger(process.env.CURSOR_SDK_BRIDGE_MAX_RUN_RETRIES, 3);
 const retryBaseDelayMs = parseInteger(process.env.CURSOR_SDK_BRIDGE_RETRY_BASE_DELAY_MS, 500);
 const defaultCwd = process.env.CURSOR_SDK_WORKING_DIRECTORY || process.cwd();
@@ -277,13 +282,11 @@ async function runLocalAgentBody(input, onRun, onEvent) {
   let text = "";
 
   const scheduleCancel = () => {
-    if (cancelTimer) clearImmediate(cancelTimer);
-    // Quiet for one event-loop turn after the latest capture, then cancel.
-    // Resetting on each capture keeps a same-turn parallel burst together.
-    cancelTimer = setImmediate(() => {
+    if (cancelTimer) clearTimeout(cancelTimer);
+    cancelTimer = setTimeout(() => {
       cancelRequested = true;
       run?.cancel().catch(() => {});
-    });
+    }, toolBurstQuietMs);
   };
 
   const captureToolCall = async (toolCall) => {
@@ -331,9 +334,8 @@ async function runLocalAgentBody(input, onRun, onEvent) {
     });
     onRun(run);
 
-    // Cancel is deferred one event-loop turn after the latest capture so a
-    // parallel onDelta burst is collected. Do not drain run.stream() after
-    // that; the canceled iterator does not end.
+    // Wait out the burst quiet window, then cancel. Do not drain run.stream()
+    // after that; the canceled iterator does not end.
     if (!capturedToolCalls.length) {
       for await (const event of run.stream()) {
         if (event.type === "assistant") {
@@ -353,7 +355,7 @@ async function runLocalAgentBody(input, onRun, onEvent) {
       }
     }
     if (capturedToolCalls.length) {
-      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setTimeout(resolve, toolBurstQuietMs));
       cancelRequested = true;
       run.cancel().catch(() => {});
     }
@@ -2137,11 +2139,41 @@ function hasDistinctIncrementalPrompt(prompt, incrementalPrompt) {
   return typeof incrementalPrompt === "string" && incrementalPrompt.trim() !== "" && incrementalPrompt !== prompt;
 }
 
+function promptLinesByPrefix(prompt, prefix) {
+  if (typeof prompt !== "string" || !prompt) return [];
+  return prompt.split("\n").filter((line) => line.startsWith(prefix));
+}
+
 function continuationFromFullPrompt(previousPrompt, nextPrompt) {
   if (typeof previousPrompt !== "string" || typeof nextPrompt !== "string") return undefined;
-  if (!previousPrompt || nextPrompt === previousPrompt || !nextPrompt.startsWith(previousPrompt)) return undefined;
-  const suffix = nextPrompt.slice(previousPrompt.length).trim();
-  return suffix || undefined;
+  if (!previousPrompt || nextPrompt === previousPrompt) return undefined;
+
+  const newToolResults = promptLinesByPrefix(nextPrompt, "LOCAL TOOL RESULT:")
+    .filter((line) => !promptLinesByPrefix(previousPrompt, "LOCAL TOOL RESULT:").includes(line));
+  const newToolText = promptLinesByPrefix(nextPrompt, "TOOL RESULT")
+    .filter((line) => !promptLinesByPrefix(previousPrompt, "TOOL RESULT").includes(line));
+  const newUsers = promptLinesByPrefix(nextPrompt, "USER:")
+    .filter((line) => !promptLinesByPrefix(previousPrompt, "USER:").includes(line));
+
+  const parts = [...newUsers, ...newToolText, ...newToolResults];
+  let kept = parts.join("\n").trim();
+
+  if (!kept && nextPrompt.startsWith(previousPrompt)) {
+    kept = nextPrompt.slice(previousPrompt.length).split("\n").filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return false;
+      if (trimmed.startsWith("ASSISTANT TOOL_CALLS:")) return false;
+      if (trimmed.startsWith("ASSISTANT:")) return false;
+      return true;
+    }).join("\n").trim();
+  }
+
+  if (!kept) return undefined;
+  return [
+    "New local tool results only. Do not restate the user request. Continue from these results:",
+    "",
+    kept
+  ].join("\n");
 }
 
 function requiredString(value, key) {

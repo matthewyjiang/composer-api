@@ -33,9 +33,29 @@ describe("Cursor SDK local-agent bridge", () => {
   });
 
   it("derives a continuation suffix when the next full prompt extends the last one", () => {
-    expect(continuationFromFullPrompt("INPUT:\nUSER: hi", "INPUT:\nUSER: hi\nTOOL RESULT: ok")).toBe("TOOL RESULT: ok");
+    const continued = continuationFromFullPrompt("INPUT:\nUSER: hi", "INPUT:\nUSER: hi\nTOOL RESULT: ok");
+    expect(continued).toContain("Do not restate the user request");
+    expect(continued).toContain("TOOL RESULT: ok");
     expect(continuationFromFullPrompt("INPUT:\nUSER: hi", "INPUT:\nUSER: hi")).toBeUndefined();
-    expect(continuationFromFullPrompt("INPUT:\nUSER: hi", "INPUT:\nUSER: other")).toBeUndefined();
+  });
+
+  it("keeps only new tool results even when the prompt prefix changed", () => {
+    const continued = continuationFromFullPrompt(
+      "OLD HEADER\nINPUT:\nUSER: rename the service command",
+      [
+        "NEW HEADER",
+        "INPUT:",
+        "USER: rename the service command",
+        "ASSISTANT TOOL_CALLS: [{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"grep\",\"arguments\":\"{}\"}}]",
+        "TOOL RESULT (name=grep tool_call_id=call_1): hits",
+        "LOCAL TOOL RESULT: {\"ok\":true}"
+      ].join("\n")
+    );
+    expect(continued).toContain("TOOL RESULT (name=grep tool_call_id=call_1): hits");
+    expect(continued).toContain("LOCAL TOOL RESULT:");
+    expect(continued).not.toContain("ASSISTANT TOOL_CALLS:");
+    expect(continued).not.toContain("rename the service command");
+    expect(continued).not.toContain("NEW HEADER");
   });
 
   it("classifies retryable Cursor SDK upstream capacity errors", () => {
