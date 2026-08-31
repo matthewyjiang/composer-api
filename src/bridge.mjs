@@ -45,6 +45,13 @@ const clientToolCallbackPath = "/client-tool-call";
 const agentCache = new Map();
 const agentRunQueues = new Map();
 let createAgentImpl = defaultCreateAgent;
+let resumeAgentImpl = defaultResumeAgent;
+// Persistent agent store (sqlite). Opened by startServer() only, so unit
+// tests and bench scripts that import this module never touch the real file.
+let agentStore = null;
+// Full prompt sends at or above this size are worth a journal line: at
+// ~4 chars/token this is ~12k tokens, several seconds of uncached prefill.
+const replayLogMinChars = parseInteger(process.env.CURSOR_SDK_BRIDGE_REPLAY_LOG_MIN_CHARS, 50 * 1024);
 const pendingRuntime = createPendingRunRuntime({
   maxPendingRuns,
   parkedCallTimeoutMs,
@@ -97,11 +104,14 @@ export {
   isCursorBuiltinToolName,
   _resetBridgeStateForTests,
   _setCreateAgentForTests,
+  _setResumeAgentForTests,
+  _setAgentStoreForTests,
   _setParkedCallTimeoutMsForTests
 };
 
 function startServer() {
   if (server) return server;
+  void openPersistentAgentStore();
   server = http.createServer((request, response) => {
     handleRequest(request, response).catch((error) => {
       writeJson(response, openAiError(error), statusFromError(error));
@@ -321,6 +331,7 @@ async function startFreshLocalAgentRun(input, onRun, onEvent) {
     agentEntry = await getAgent(input);
   }
   const prompt = reuseCache ? incrementalPrompt : input.prompt;
+  logFullReplay(input, agentEntry, reuseCache, prompt);
   rememberAgentPrompt(agentEntry.cacheKey, input.prompt);
   const pending = pendingRuntime.beginPendingRun(input, agentEntry, runToken);
   const sendInput = { ...input, runToken, mcpToken: agentEntry.mcpToken };
@@ -354,16 +365,66 @@ async function getAgent(input) {
     return { agent: cached.agent, cacheKey, cached: true, mcpToken: cached.mcpToken };
   }
 
+  const resumed = await resumeStoredAgent(input, cacheKey);
+  if (resumed) return resumed;
+
   const mcpToken = crypto.randomUUID();
   const agent = await createAgentImpl({ ...input, mcpToken });
   agentCache.set(cacheKey, { agent, touchedAt: Date.now(), mcpToken });
+  agentStore?.put({ cacheKey, agentId: agent.agentId, mcpToken });
   evictAgents();
   return { agent, cacheKey, cached: false, mcpToken };
+}
+
+// After a restart the in-memory cache is empty but the Cursor-side agent (and
+// its server prompt cache) still exists. Resume it by the persisted agentId so
+// the next turn sends a delta instead of replaying the full transcript. The
+// persisted mcpToken keeps the MCP env byte-identical, so the SDK does not
+// respawn the stdio child.
+async function resumeStoredAgent(input, cacheKey) {
+  const stored = agentStore?.get(cacheKey);
+  if (!stored) return undefined;
+  try {
+    const agent = await resumeAgentImpl(stored.agentId, { ...input, mcpToken: stored.mcpToken });
+    agentCache.set(cacheKey, { agent, touchedAt: Date.now(), mcpToken: stored.mcpToken });
+    if (stored.fullPrompt) agentFullPrompts.set(cacheKey, stored.fullPrompt);
+    evictAgents();
+    console.log(`Resumed persisted Cursor agent ${stored.agentId} for session ${cacheKey.slice(0, 8)}.`);
+    return { agent, cacheKey, cached: true, mcpToken: stored.mcpToken };
+  } catch (error) {
+    agentStore?.delete(cacheKey);
+    console.warn(`Failed to resume persisted agent ${stored.agentId}; creating a fresh one. (${error?.message || error})`);
+    return undefined;
+  }
 }
 
 async function defaultCreateAgent(input) {
   const { Agent } = await import("@cursor/sdk");
   return Agent.create(localAgentCreateOptions(input));
+}
+
+// Best effort: a failed open degrades to in-memory-only caching (pre-existing
+// behavior), it never blocks serving.
+async function openPersistentAgentStore() {
+  if (agentStore) return;
+  const file =
+    process.env.CURSOR_SDK_BRIDGE_AGENT_STORE
+    || path.join(
+      process.env.XDG_STATE_HOME?.trim() || path.join(process.env.HOME || "", ".local", "state"),
+      "api-for-cursor",
+      "agent-store.sqlite3"
+    );
+  try {
+    const { openAgentStore } = await import("./bridge-agent-store.mjs");
+    agentStore = await openAgentStore(file);
+  } catch (error) {
+    console.warn(`Persistent agent store unavailable (${error?.message || error}); sessions will not survive restarts.`);
+  }
+}
+
+async function defaultResumeAgent(agentId, input) {
+  const { Agent } = await import("@cursor/sdk");
+  return Agent.resume(agentId, localAgentCreateOptions(input));
 }
 
 function evictAgent(cacheKey, agent) {
@@ -372,6 +433,9 @@ function evictAgent(cacheKey, agent) {
     agentCache.delete(cacheKey);
   }
   agentFullPrompts.delete(cacheKey);
+  // Deliberate eviction means the agent state is stale or broken; do not
+  // resume it after a restart either.
+  agentStore?.delete(cacheKey);
   try {
     agent.close();
   } catch {}
@@ -383,7 +447,21 @@ function evictAgent(cacheKey, agent) {
 const agentFullPrompts = new Map();
 
 function rememberAgentPrompt(cacheKey, fullPrompt) {
-  if (typeof fullPrompt === "string" && fullPrompt) agentFullPrompts.set(cacheKey, fullPrompt);
+  if (typeof fullPrompt !== "string" || !fullPrompt) return;
+  agentFullPrompts.set(cacheKey, fullPrompt);
+  agentStore?.updatePrompt(cacheKey, fullPrompt);
+}
+
+// The slow path (full uncached prefill) must be visible in the journal:
+// which session, how big, and why the warm-agent delta was not used.
+function logFullReplay(input, agentEntry, reuseCache, prompt) {
+  if (reuseCache) return;
+  const chars = typeof prompt === "string" ? prompt.length : 0;
+  if (chars < replayLogMinChars) return;
+  const reason = agentEntry.cached ? "prefix mismatch on warm agent" : "no warm agent (cold start or evicted)";
+  console.warn(
+    `Full prompt replay for session ${agentEntry.cacheKey.slice(0, 8)}: ${chars} chars uncached (${reason}). Expect slow TTFT.`
+  );
 }
 
 function derivedIncrementalPrompt(agentEntry, fullPrompt) {
@@ -2232,6 +2310,7 @@ async function closeAndExit(code) {
       entry.agent.close();
     } catch {}
   }
+  agentStore?.close();
   server?.close(() => process.exit(code));
   setTimeout(() => process.exit(code), 500).unref();
 }
@@ -2246,10 +2325,21 @@ function _resetBridgeStateForTests() {
   agentRunQueues.clear();
   agentFullPrompts.clear();
   createAgentImpl = defaultCreateAgent;
+  resumeAgentImpl = defaultResumeAgent;
+  agentStore?.close();
+  agentStore = null;
 }
 
 function _setCreateAgentForTests(factory) {
   createAgentImpl = factory || defaultCreateAgent;
+}
+
+function _setResumeAgentForTests(factory) {
+  resumeAgentImpl = factory || defaultResumeAgent;
+}
+
+function _setAgentStoreForTests(store) {
+  agentStore = store || null;
 }
 
 function _setParkedCallTimeoutMsForTests(value) {

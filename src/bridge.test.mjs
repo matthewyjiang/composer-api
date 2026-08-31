@@ -26,6 +26,8 @@ import {
   isCursorBuiltinToolName,
   _resetBridgeStateForTests,
   _setCreateAgentForTests,
+  _setResumeAgentForTests,
+  _setAgentStoreForTests,
   _setParkedCallTimeoutMsForTests
 } from "./bridge.mjs";
 
@@ -129,6 +131,150 @@ describe("Cursor SDK local-agent bridge", () => {
       "full transcript turn 1",
       "USER: turn 2 delta"
     ]);
+    _resetBridgeStateForTests();
+  });
+
+  it("resumes a persisted agent after restart and sends only the delta", async () => {
+    _resetBridgeStateForTests();
+    const store = fakeAgentStore();
+    _setAgentStoreForTests(store);
+    let creates = 0;
+    let resumes = 0;
+    const prompts = [];
+    const fakeAgent = (id) => ({
+      agentId: id,
+      close() {},
+      async send(prompt) {
+        prompts.push(prompt);
+        return {
+          id: `run-${prompts.length}`,
+          async *stream() {
+            yield { type: "assistant", message: { content: [{ type: "text", text: "ok" }] } };
+          },
+          async wait() {
+            return { status: "finished", result: "ok" };
+          },
+          async cancel() {}
+        };
+      }
+    });
+    _setCreateAgentForTests(async () => {
+      creates += 1;
+      return fakeAgent(`agent-${creates}`);
+    });
+    _setResumeAgentForTests(async (agentId) => {
+      resumes += 1;
+      return fakeAgent(agentId);
+    });
+    const base = {
+      apiKey: "test-key",
+      model: "composer-2.5",
+      sessionKey: "resume-session",
+      workingDirectory: "/tmp/project",
+      clientTools: []
+    };
+    await runLocalAgent({ ...base, prompt: "full transcript turn 1", requestId: "req-1" });
+    expect(creates).toBe(1);
+
+    // Simulate a service restart: in-memory caches are gone, the store is not.
+    _resetBridgeStateForTests();
+    _setAgentStoreForTests(store);
+    _setCreateAgentForTests(async () => {
+      creates += 1;
+      return fakeAgent(`agent-${creates}`);
+    });
+    _setResumeAgentForTests(async (agentId) => {
+      resumes += 1;
+      return fakeAgent(agentId);
+    });
+
+    // No incrementalPrompt from the server; the persisted full prompt must
+    // still yield a derived delta on the resumed agent.
+    await runLocalAgent({
+      ...base,
+      prompt: "full transcript turn 1\nUSER: turn 2 delta",
+      requestId: "req-2"
+    });
+    expect(creates).toBe(1);
+    expect(resumes).toBe(1);
+    expect(prompts).toEqual(["full transcript turn 1", "USER: turn 2 delta"]);
+    _resetBridgeStateForTests();
+  });
+
+  it("falls back to a fresh agent when resuming the persisted one fails", async () => {
+    _resetBridgeStateForTests();
+    const store = fakeAgentStore();
+    store.put({ cacheKey: "any", agentId: "agent-gone", mcpToken: "tok" });
+    _setAgentStoreForTests(store);
+    let creates = 0;
+    const prompts = [];
+    _setCreateAgentForTests(async () => {
+      creates += 1;
+      return {
+        agentId: `agent-${creates}`,
+        close() {},
+        async send(prompt) {
+          prompts.push(prompt);
+          return {
+            id: `run-${prompts.length}`,
+            async *stream() {
+              yield { type: "assistant", message: { content: [{ type: "text", text: "ok" }] } };
+            },
+            async wait() {
+              return { status: "finished", result: "ok" };
+            },
+            async cancel() {}
+          };
+        }
+      };
+    });
+    _setResumeAgentForTests(async () => {
+      throw new Error("agent not found upstream");
+    });
+    // Seed the store under the real cache key by running once, then clear
+    // memory and point the stored row at a broken agent id.
+    const base = {
+      apiKey: "test-key",
+      model: "composer-2.5",
+      sessionKey: "resume-fail-session",
+      workingDirectory: "/tmp/project",
+      clientTools: []
+    };
+    await runLocalAgent({ ...base, prompt: "turn 1", requestId: "req-1" });
+    const storedKey = [...store.rows.keys()].find((key) => key !== "any");
+    expect(storedKey).toBeDefined();
+    _resetBridgeStateForTests();
+    _setAgentStoreForTests(store);
+    _setCreateAgentForTests(async () => {
+      creates += 1;
+      return {
+        agentId: `agent-${creates}`,
+        close() {},
+        async send(prompt) {
+          prompts.push(prompt);
+          return {
+            id: `run-${prompts.length}`,
+            async *stream() {
+              yield { type: "assistant", message: { content: [{ type: "text", text: "ok" }] } };
+            },
+            async wait() {
+              return { status: "finished", result: "ok" };
+            },
+            async cancel() {}
+          };
+        }
+      };
+    });
+    _setResumeAgentForTests(async () => {
+      throw new Error("agent not found upstream");
+    });
+
+    await runLocalAgent({ ...base, prompt: "turn 1\nturn 2", requestId: "req-2" });
+    // Resume failed: a fresh agent was created, the broken row was dropped,
+    // and the full prompt (not a delta) went to the new agent.
+    expect(creates).toBe(2);
+    expect(prompts.at(-1)).toBe("turn 1\nturn 2");
+    expect(store.rows.get(storedKey)?.agentId).toBe("agent-2");
     _resetBridgeStateForTests();
   });
 
@@ -2480,6 +2626,31 @@ async function runMcpChildOnce({
   input.end(`${JSON.stringify(message)}\n`);
   await running;
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
+}
+
+// In-memory stand-in for the sqlite agent store. close() is a no-op so the
+// same store instance can survive a simulated restart via
+// _resetBridgeStateForTests().
+function fakeAgentStore() {
+  const rows = new Map();
+  return {
+    rows,
+    get(cacheKey) {
+      const row = rows.get(cacheKey);
+      return row ? { ...row } : undefined;
+    },
+    put({ cacheKey, agentId, mcpToken }) {
+      rows.set(cacheKey, { agentId, mcpToken, fullPrompt: "" });
+    },
+    updatePrompt(cacheKey, fullPrompt) {
+      const row = rows.get(cacheKey);
+      if (row) row.fullPrompt = fullPrompt;
+    },
+    delete(cacheKey) {
+      rows.delete(cacheKey);
+    },
+    close() {}
+  };
 }
 
 function parkedHttp() {
